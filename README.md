@@ -2,9 +2,9 @@
 
 这是一个用于学习 Linux 网络编程和 HTTP 的 C++ 项目。
 
-当前进度：已经完成阻塞式 Socket 层，包括 `socket()`、`setsockopt()`、
-`bind()`、`listen()`、`accept()`、`recv()`、`send()` 和 `close()`。
-程序会依次处理客户端，把收到的数据原样发送回去。
+当前进度：已经完成阻塞式 Socket 层、简单 HTTP Request 解析，以及
+`HttpResponse` 的生成、序列化和发送。服务器可以响应 `/hello`、`/health`，
+并为未知路径、非 GET 方法和错误请求返回对应状态码。
 
 ## 当前结构
 
@@ -15,35 +15,29 @@
 ├── README.md       # 当前进度和学习任务
 ├── guide.md        # 项目整体规划
 ├── include/
+│   ├── http/
+│   │   ├── http_request.h  # HTTP 请求类型和解析接口
+│   │   └── http_response.h # HTTP 响应类型和序列化接口
 │   └── server/
-│       └── http_server.h  # 网络模块对外接口
+│       └── http_server.h  # Socket 模块对外接口
 └── src/
-    ├── http_server.cpp    # Socket 层系统调用及错误处理
-    └── main.cpp           # 程序入口和调用流程
+    ├── http_request.cpp    # 简单 HTTP 请求行解析
+    ├── http_response.cpp   # GET 处理和响应序列化
+    ├── http_server.cpp     # Socket 层系统调用及错误处理
+    └── main.cpp            # 接收、累计并解析请求
 ```
 
 ## 构建
 
-当前环境还没有安装 CMake，可以先直接使用 g++：
-
 ```bash
-mkdir -p build
-g++ -std=c++20 -Wall -Wextra -Wpedantic \
-    -Iinclude src/main.cpp src/http_server.cpp \
-    -o build/http_server
+cmake -S . -B build
+cmake --build build
 ```
 
 运行程序：
 
 ```bash
 ./build/http_server
-```
-
-安装 CMake 后，也可以使用标准构建方式：
-
-```bash
-cmake -S . -B build
-cmake --build build
 ```
 
 ## 运行和验证
@@ -60,17 +54,32 @@ cmake --build build
 nc 127.0.0.1 8080
 ```
 
-输入任意内容并回车，服务器会把收到的数据原样发送回来。服务器会持续读取当前
-连接，直到客户端断开。当前采用阻塞式串行模型：一个客户端断开后，服务器才会
-接受下一个客户端。
+可以使用 netcat 发送一条完整的 HTTP 请求：
 
-## 当前 Socket 层接口
+```bash
+printf 'GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n' |
+    nc -N 127.0.0.1 8080
+```
 
-阅读三个文件之间的关系：
+服务器终端会输出：
 
-1. `http_server.h` 声明其他代码可以调用什么。
-2. `http_server.cpp` 实现 Socket 系统调用和错误处理。
-3. `main.cpp` 组织“接受连接、收取数据、回送数据”的流程。
+```text
+Parsed HTTP request:
+  method  = GET
+  path    = /hello
+  version = HTTP/1.1
+```
+
+当前采用阻塞式串行模型，并且每个连接只处理一个请求，响应头会明确发送
+`Connection: close`。
+
+## 当前模块关系
+
+阅读各文件之间的关系：
+
+1. `http_server.h/.cpp` 提供 Socket 收发能力，不理解 HTTP。
+2. `http_request.h/.cpp` 接收一段完整文本，解析 HTTP 请求行。
+3. `main.cpp` 累计 Socket 收到的字节，发现 Header 完整后调用解析器。
 
 当前接口包括：
 
@@ -87,8 +96,8 @@ nc 127.0.0.1 8080
 - 为什么不能直接使用 `printf("%s", buffer)` 输出网络数据。
 - 为什么 `send_all()` 需要循环调用 `send()`。
 
-下一步是实现 HTTP 请求解析。在此之前，Socket 层只负责字节传输，不理解
-GET、路径、Header 等 HTTP 概念。
+下一步可以将 `handle_http_request()` 中的路径判断拆成独立 Router，或者先为
+Request、Response 和路由行为补充单元测试。
 
 ## 学习约定
 

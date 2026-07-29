@@ -10,12 +10,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_executable(http_server
     src/main.cpp
     src/http_server.cpp
+    src/http_request.cpp
+    src/http_response.cpp
 )
 
 # 只对 http_server 目标启用 C++20。
 target_compile_features(http_server PRIVATE cxx_std_20)
 
-# 允许源码使用 #include "server/http_server.h"。
+# 将 include/ 设为头文件根目录，例如可以包含 server/ 和 http/ 下的头文件。
 target_include_directories(http_server
     PRIVATE
         "${PROJECT_SOURCE_DIR}/include"
