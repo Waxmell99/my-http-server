@@ -32,3 +32,31 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
             -Wpedantic
     )
 endif()
+
+# 启用 CTest，并在 BUILD_TESTING=ON 时构建 HTTP 单元测试。
+include(CTest)
+
+if(BUILD_TESTING)
+    add_executable(http_tests
+        tests/http_test.cpp
+        src/http_request.cpp
+        src/http_response.cpp
+    )
+
+    target_compile_features(http_tests PRIVATE cxx_std_20)
+    target_include_directories(http_tests
+        PRIVATE
+            "${PROJECT_SOURCE_DIR}/include"
+    )
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(http_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    add_test(NAME http_tests COMMAND http_tests)
+endif()

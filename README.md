@@ -20,11 +20,13 @@
 │   │   └── http_response.h # HTTP 响应类型和序列化接口
 │   └── server/
 │       └── http_server.h  # Socket 模块对外接口
-└── src/
+├── src/
     ├── http_request.cpp    # 简单 HTTP 请求行解析
     ├── http_response.cpp   # GET 处理和响应序列化
     ├── http_server.cpp     # Socket 层系统调用及错误处理
     └── main.cpp            # 接收、累计并解析请求
+└── tests/
+    └── http_test.cpp        # Request 和 Response 单元测试
 ```
 
 ## 构建
@@ -32,6 +34,18 @@
 ```bash
 cmake -S . -B build
 cmake --build build
+```
+
+运行测试：
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+如果希望查看每个检查项的输出，可以直接运行：
+
+```bash
+./build/http_tests
 ```
 
 运行程序：
