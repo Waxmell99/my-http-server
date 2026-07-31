@@ -1,5 +1,6 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
+#include "http/router.h"
 
 #include <iostream>
 #include <string>
@@ -46,23 +47,23 @@ void test_invalid_requests() {
            "reject a non-HTTP version");
 }
 
-void test_request_handling() {
-    personal_cloud::HttpResponse response;
-
-    const bool hello_handled = personal_cloud::handle_http_request(
-        {"GET", "/hello", "HTTP/1.1"}, response);
-    expect(hello_handled, "handle GET /hello");
+void test_routing() {
+    personal_cloud::HttpResponse response = personal_cloud::route_request(
+        {"GET", "/hello", "HTTP/1.1"});
     expect(response.status_code == 200, "GET /hello returns 200");
     expect(response.body == "Hello World\n", "GET /hello returns its body");
 
-    const bool missing_handled = personal_cloud::handle_http_request(
-        {"GET", "/missing", "HTTP/1.1"}, response);
-    expect(!missing_handled, "report an unmatched route");
+    response = personal_cloud::route_request(
+        {"GET", "/health", "HTTP/1.1"});
+    expect(response.status_code == 200, "GET /health returns 200");
+    expect(response.body == "OK\n", "GET /health returns its body");
+
+    response = personal_cloud::route_request(
+        {"GET", "/missing", "HTTP/1.1"});
     expect(response.status_code == 404, "unknown GET path returns 404");
 
-    const bool post_handled = personal_cloud::handle_http_request(
-        {"POST", "/hello", "HTTP/1.1"}, response);
-    expect(!post_handled, "report an unsupported method");
+    response = personal_cloud::route_request(
+        {"POST", "/hello", "HTTP/1.1"});
     expect(response.status_code == 405, "unsupported method returns 405");
 }
 
@@ -93,7 +94,7 @@ void test_response_serialization() {
 int main() {
     test_valid_request();
     test_invalid_requests();
-    test_request_handling();
+    test_routing();
     test_response_serialization();
 
     if (failure_count != 0) {

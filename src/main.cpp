@@ -1,5 +1,6 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
+#include "http/router.h"
 #include "server/http_server.h"
 
 #include <array>
@@ -70,10 +71,8 @@ void handle_client(int client_fd) {
                   << "  path    = " << request.path << '\n'
                   << "  version = " << request.version << '\n';
 
-        personal_cloud::HttpResponse response;
-
-        // 即使路由不存在或方法不支持，response 中也包含 404/405 响应。
-        personal_cloud::handle_http_request(request, response);
+        const personal_cloud::HttpResponse response =
+            personal_cloud::route_request(request);
         send_http_response(client_fd, response);
         return;
     }

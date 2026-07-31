@@ -12,6 +12,7 @@ add_executable(http_server
     src/http_server.cpp
     src/http_request.cpp
     src/http_response.cpp
+    src/router.cpp
 )
 
 # 只对 http_server 目标启用 C++20。
@@ -41,6 +42,7 @@ if(BUILD_TESTING)
         tests/http_test.cpp
         src/http_request.cpp
         src/http_response.cpp
+        src/router.cpp
     )
 
     target_compile_features(http_tests PRIVATE cxx_std_20)

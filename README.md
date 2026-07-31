@@ -17,16 +17,18 @@
 ├── include/
 │   ├── http/
 │   │   ├── http_request.h  # HTTP 请求类型和解析接口
-│   │   └── http_response.h # HTTP 响应类型和序列化接口
+│   │   ├── http_response.h # HTTP 响应类型和序列化接口
+│   │   └── router.h        # 路由选择接口
 │   └── server/
 │       └── http_server.h  # Socket 模块对外接口
 ├── src/
-    ├── http_request.cpp    # 简单 HTTP 请求行解析
-    ├── http_response.cpp   # GET 处理和响应序列化
-    ├── http_server.cpp     # Socket 层系统调用及错误处理
-    └── main.cpp            # 接收、累计并解析请求
+│   ├── http_request.cpp    # 简单 HTTP 请求行解析
+│   ├── http_response.cpp   # HTTP 响应序列化
+│   ├── http_server.cpp     # Socket 层系统调用及错误处理
+│   ├── router.cpp          # method/path 匹配和响应生成
+│   └── main.cpp            # 接收、累计并解析请求
 └── tests/
-    └── http_test.cpp        # Request 和 Response 单元测试
+    └── http_test.cpp        # Request、Router 和 Response 测试
 ```
 
 ## 构建
@@ -93,7 +95,9 @@ Parsed HTTP request:
 
 1. `http_server.h/.cpp` 提供 Socket 收发能力，不理解 HTTP。
 2. `http_request.h/.cpp` 接收一段完整文本，解析 HTTP 请求行。
-3. `main.cpp` 累计 Socket 收到的字节，发现 Header 完整后调用解析器。
+3. `router.h/.cpp` 根据 method 和 path 选择响应。
+4. `http_response.h/.cpp` 把响应对象序列化为 HTTP 文本。
+5. `main.cpp` 负责组合上述模块。
 
 当前接口包括：
 
@@ -110,8 +114,8 @@ Parsed HTTP request:
 - 为什么不能直接使用 `printf("%s", buffer)` 输出网络数据。
 - 为什么 `send_all()` 需要循环调用 `send()`。
 
-下一步可以将 `handle_http_request()` 中的路径判断拆成独立 Router，或者先为
-Request、Response 和路由行为补充单元测试。
+下一步可以将 Router 从固定的 `if` 判断演进为可注册的路由表，或者先
+扩展 HTTP Header 解析。
 
 ## 学习约定
 
