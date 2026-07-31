@@ -1,19 +1,33 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace personal_cloud {
 
-// 当前只保存 HTTP 请求行中的三个部分。
+enum class HttpParseResult {
+    incomplete,
+    complete,
+    bad_request,
+    payload_too_large,
+};
+
+// HTTP Header 名会在解析时统一转换为小写。
 struct HttpRequest {
     std::string method;
     std::string path;
     std::string version;
+    std::unordered_map<std::string, std::string> headers;
+    std::string body;
 };
 
-// 解析完整 HTTP Header 中的请求行。
-// 成功时填写 request 并返回 true，数据不完整或格式错误时返回 false。
-bool parse_http_request(std::string_view raw_request, HttpRequest& request);
+// 解析请求行、Header 和 Content-Length 指定的 Body。
+// 只有返回 complete 时才会填写 request。
+HttpParseResult parse_http_request(
+    std::string_view raw_request,
+    HttpRequest& request,
+    std::size_t maximum_body_size);
 
 }  // namespace personal_cloud

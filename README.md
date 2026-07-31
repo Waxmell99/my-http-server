@@ -2,9 +2,9 @@
 
 这是一个用于学习 Linux 网络编程和 HTTP 的 C++ 项目。
 
-当前进度：已经完成阻塞式 Socket 层、简单 HTTP Request 解析，以及
-`HttpResponse` 的生成、序列化和发送。服务器可以响应 `/hello`、`/health`，
-并为未知路径、非 GET 方法和错误请求返回对应状态码。
+当前进度：已经完成阻塞式 Socket 层、HTTP Request/Response、路由和单元测试。
+请求解析器支持 Header、`Content-Length` 和 Body，服务器可以处理 GET，
+以及在内存中接收简单的 `text/plain` POST 内容。
 
 ## 当前结构
 
@@ -89,12 +89,31 @@ Parsed HTTP request:
 当前采用阻塞式串行模型，并且每个连接只处理一个请求，响应头会明确发送
 `Connection: close`。
 
+发送文本 POST：
+
+```bash
+curl -v \
+    -H 'Content-Type: text/plain' \
+    --data-binary 'hello upload' \
+    http://127.0.0.1:8080/upload
+```
+
+服务器会返回：
+
+```text
+Received text:
+hello upload
+```
+
+当前 `/upload` 只在内存中接收并回显文本，不会写入磁盘。Header 限制为
+16 KiB，Body 限制为 64 KiB。
+
 ## 当前模块关系
 
 阅读各文件之间的关系：
 
 1. `http_server.h/.cpp` 提供 Socket 收发能力，不理解 HTTP。
-2. `http_request.h/.cpp` 接收一段完整文本，解析 HTTP 请求行。
+2. `http_request.h/.cpp` 解析请求行、Header、`Content-Length` 和 Body。
 3. `router.h/.cpp` 根据 method 和 path 选择响应。
 4. `http_response.h/.cpp` 把响应对象序列化为 HTTP 文本。
 5. `main.cpp` 负责组合上述模块。
@@ -114,8 +133,8 @@ Parsed HTTP request:
 - 为什么不能直接使用 `printf("%s", buffer)` 输出网络数据。
 - 为什么 `send_all()` 需要循环调用 `send()`。
 
-下一步可以将 Router 从固定的 `if` 判断演进为可注册的路由表，或者先
-扩展 HTTP Header 解析。
+下一步可以将 Router 从固定的 `if` 判断演进为可注册的路由表，或者将
+`/upload` 改为把文本保存到文件或 SQLite。
 
 ## 学习约定
 
