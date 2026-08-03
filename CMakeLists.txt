@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 定义最终生成的可执行程序，以及参与编译的源文件。
 add_executable(http_server
     src/main.cpp
+    src/client_handler.cpp
     src/http_server.cpp
     src/http_request.cpp
     src/http_response.cpp

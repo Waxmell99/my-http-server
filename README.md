@@ -20,8 +20,10 @@
 │   │   ├── http_response.h # HTTP 响应类型和序列化接口
 │   │   └── router.h        # 路由选择接口
 │   └── server/
-│       └── http_server.h  # Socket 模块对外接口
+│       ├── client_handler.h # 单个客户端请求处理接口
+│       └── http_server.h    # Socket 模块对外接口
 ├── src/
+│   ├── client_handler.cpp  # 接收、解析并响应客户端
 │   ├── http_request.cpp    # 简单 HTTP 请求行解析
 │   ├── http_response.cpp   # HTTP 响应序列化
 │   ├── http_server.cpp     # Socket 层系统调用及错误处理
@@ -108,6 +110,10 @@ hello upload
 当前 `/upload` 只在内存中接收并回显文本，不会写入磁盘。Header 限制为
 16 KiB，Body 限制为 64 KiB。
 
+每个客户端 Socket 当前设置了 5 秒收发超时。请求在 5 秒内没有新数据时，
+`receive_data()` 返回 `ReceiveStatus::timeout`，ClientHandler 尝试返回
+`408 Request Timeout` 并关闭连接。
+
 ## 当前模块关系
 
 阅读各文件之间的关系：
@@ -116,13 +122,15 @@ hello upload
 2. `http_request.h/.cpp` 解析请求行、Header、`Content-Length` 和 Body。
 3. `router.h/.cpp` 根据 method 和 path 选择响应。
 4. `http_response.h/.cpp` 把响应对象序列化为 HTTP 文本。
-5. `main.cpp` 负责组合上述模块。
+5. `client_handler.h/.cpp` 组合收发、解析、路由和响应流程。
+6. `main.cpp` 只负责监听、接受连接和关闭客户端 Socket。
 
 当前接口包括：
 
 - `create_listening_socket()`：创建、绑定并监听。
 - `accept_client()`：接受一个客户端连接。
-- `receive_data()`：接收一次数据。
+- `set_socket_timeouts()`：设置客户端 Socket 的收发超时。
+- `receive_data()`：返回数据、对端关闭、超时或普通错误状态。
 - `send_all()`：处理一次 `send()` 没有发完的情况。
 - `close_socket()`：关闭 Socket。
 

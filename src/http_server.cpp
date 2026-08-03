@@ -5,6 +5,7 @@
 
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace personal_cloud {
@@ -63,18 +64,67 @@ int accept_client(int listening_fd) {
     return client_fd;
 }
 
-ssize_t receive_data(int client_fd, char* buffer, std::size_t buffer_size) {
+bool set_socket_timeouts(int socket_fd, int receive_timeout_seconds, int send_timeout_seconds) {
+    if (receive_timeout_seconds < 0 || send_timeout_seconds < 0) {
+        errno = EINVAL;
+        std::perror("invalid Socket timeout");
+        return false;
+    }
+
+    timeval receive_timeout {};
+    receive_timeout.tv_sec = receive_timeout_seconds;
+
+    if (::setsockopt(socket_fd,
+                    SOL_SOCKET,
+                    SO_RCVTIMEO,
+                    &receive_timeout,
+                    sizeof(receive_timeout)) == -1) {
+        std::perror("setsockopt SO_RCVTIMEO");
+        return false;
+    }
+
+    timeval send_timeout {};
+    send_timeout.tv_sec = send_timeout_seconds;
+
+    if (::setsockopt(socket_fd,
+                    SOL_SOCKET,
+                    SO_SNDTIMEO,
+                    &send_timeout,
+                    sizeof(send_timeout)) == -1) {
+        std::perror("setsockopt SO_SNDTIMEO");
+        return false;
+    }
+
+    return true;
+}
+
+ReceiveResult receive_data(
+    int client_fd,
+    char* buffer,
+    std::size_t buffer_size) {
     ssize_t received = -1;
 
     do {
         received = ::recv(client_fd, buffer, buffer_size, 0);
     } while (received == -1 && errno == EINTR);
 
-    if (received == -1) {
-        std::perror("recv");
+    if (received > 0) {
+        return {
+            ReceiveStatus::data,
+            static_cast<std::size_t>(received),
+        };
     }
 
-    return received;
+    if (received == 0) {
+        return {ReceiveStatus::peer_closed, 0};
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return {ReceiveStatus::timeout, 0};
+    }
+
+    std::perror("recv");
+    return {ReceiveStatus::error, 0};
 }
 
 bool send_all(int client_fd, const char* data, std::size_t data_size) {
