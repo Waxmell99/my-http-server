@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.20)
 # 定义项目名称、版本和使用的语言。
 project(personal_cloud_server VERSION 0.1.0 LANGUAGES CXX)
 
+find_package(Threads REQUIRED)
+
 # 生成 compile_commands.json，方便 clangd 等工具理解项目。
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -14,6 +16,7 @@ add_executable(http_server
     src/http_request.cpp
     src/http_response.cpp
     src/router.cpp
+    src/thread_pool.cpp
 )
 
 # 只对 http_server 目标启用 C++20。
@@ -24,6 +27,8 @@ target_include_directories(http_server
     PRIVATE
         "${PROJECT_SOURCE_DIR}/include"
 )
+
+target_link_libraries(http_server PRIVATE Threads::Threads)
 
 # GCC 和 Clang 使用的常见警告选项。
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -62,4 +67,27 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME http_tests COMMAND http_tests)
+
+    add_executable(thread_pool_tests
+        tests/thread_pool_test.cpp
+        src/thread_pool.cpp
+    )
+
+    target_compile_features(thread_pool_tests PRIVATE cxx_std_20)
+    target_include_directories(thread_pool_tests
+        PRIVATE
+            "${PROJECT_SOURCE_DIR}/include"
+    )
+    target_link_libraries(thread_pool_tests PRIVATE Threads::Threads)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(thread_pool_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    add_test(NAME thread_pool_tests COMMAND thread_pool_tests)
 endif()

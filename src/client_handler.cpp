@@ -1,3 +1,4 @@
+#include "common/log.h"
 #include "server/client_handler.h"
 
 #include "http/http_request.h"
@@ -53,12 +54,13 @@ void handle_client(int client_fd) {
                 break;
 
             case ReceiveStatus::peer_closed:
-                std::cout
-                    << "Client closed before sending a complete request.\n";
+                write_log(
+                    std::cout,
+                    "Client closed before sending a complete request.\n");
                 return;
 
             case ReceiveStatus::timeout:
-                std::cerr << "Client receive timeout.\n";
+                write_log(std::cerr, "Client receive timeout.\n");
                 send_error_response(
                     client_fd,
                     408,
@@ -79,7 +81,7 @@ void handle_client(int client_fd) {
              request_buffer.size() > maximum_header_size) ||
             (headers_end != std::string::npos &&
              headers_end + header_terminator.size() > maximum_header_size)) {
-            std::cerr << "HTTP Header is too large.\n";
+            write_log(std::cerr, "HTTP Header is too large.\n");
             send_error_response(
                 client_fd,
                 431,
@@ -97,13 +99,13 @@ void handle_client(int client_fd) {
                 continue;
 
             case HttpParseResult::bad_request:
-                std::cerr << "Malformed HTTP request.\n";
+                write_log(std::cerr, "Malformed HTTP request.\n");
                 send_error_response(
                     client_fd, 400, "Bad Request", "Bad Request\n");
                 return;
 
             case HttpParseResult::payload_too_large:
-                std::cerr << "HTTP Body is too large.\n";
+                write_log(std::cerr, "HTTP Body is too large.\n");
                 send_error_response(
                     client_fd,
                     413,
@@ -115,12 +117,14 @@ void handle_client(int client_fd) {
                 break;
         }
 
-        std::cout << "Parsed HTTP request:\n"
-                  << "  method  = " << request.method << '\n'
-                  << "  path    = " << request.path << '\n'
-                  << "  version = " << request.version << '\n'
-                  << "  headers = " << request.headers.size() << '\n'
-                  << "  body    = " << request.body.size() << " bytes\n";
+        write_log(
+            std::cout,
+            "Parsed HTTP request:\n",
+            "  method  = ", request.method, '\n',
+            "  path    = ", request.path, '\n',
+            "  version = ", request.version, '\n',
+            "  headers = ", request.headers.size(), '\n',
+            "  body    = ", request.body.size(), " bytes\n");
 
         const HttpResponse response = route_request(request);
         send_http_response(client_fd, response);
