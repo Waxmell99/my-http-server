@@ -26,6 +26,9 @@ int create_listening_socket(std::uint16_t port, int backlog);
 // 成功时返回客户端 Socket 文件描述符，失败时返回 -1。
 int accept_client(int listening_fd);
 
+// 将 Socket 设置为非阻塞模式，供 epoll 事件循环使用。
+bool set_socket_nonblocking(int socket_fd);
+
 // 从客户端接收一次数据，并区分数据、关闭、超时和错误。
 ReceiveResult receive_data(
     int client_fd,

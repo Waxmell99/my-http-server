@@ -11,12 +11,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 定义最终生成的可执行程序，以及参与编译的源文件。
 add_executable(http_server
     src/main.cpp
-    src/client_handler.cpp
+    src/epoll_server.cpp
     src/http_server.cpp
     src/http_request.cpp
     src/http_response.cpp
     src/router.cpp
-    src/thread_pool.cpp
 )
 
 # 只对 http_server 目标启用 C++20。
@@ -27,8 +26,6 @@ target_include_directories(http_server
     PRIVATE
         "${PROJECT_SOURCE_DIR}/include"
 )
-
-target_link_libraries(http_server PRIVATE Threads::Threads)
 
 # GCC 和 Clang 使用的常见警告选项。
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

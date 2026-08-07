@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdio>
 
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -57,11 +58,26 @@ int accept_client(int listening_fd) {
         client_fd = ::accept(listening_fd, nullptr, nullptr);
     } while (client_fd == -1 && errno == EINTR);
 
-    if (client_fd == -1) {
+    if (client_fd == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
         std::perror("accept");
     }
 
     return client_fd;
+}
+
+bool set_socket_nonblocking(int socket_fd) {
+    const int current_flags = ::fcntl(socket_fd, F_GETFL, 0);
+    if (current_flags == -1) {
+        std::perror("fcntl F_GETFL");
+        return false;
+    }
+
+    if (::fcntl(socket_fd, F_SETFL, current_flags | O_NONBLOCK) == -1) {
+        std::perror("fcntl F_SETFL O_NONBLOCK");
+        return false;
+    }
+
+    return true;
 }
 
 bool set_socket_timeouts(int socket_fd, int receive_timeout_seconds, int send_timeout_seconds) {

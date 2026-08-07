@@ -1,10 +1,86 @@
 #include "http/router.h"
 
+#include <fstream>
+#include <optional>
+#include <sstream>
+#include <string>
 #include <string_view>
 
 namespace personal_cloud {
+namespace {
+
+std::optional<std::string> read_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return std::nullopt;
+    }
+
+    std::ostringstream content;
+    content << file.rdbuf();
+    return content.str();
+}
+
+}
 
 HttpResponse route_request(const HttpRequest& request) {
+    if (request.path == "/") {
+        if (request.method != "GET") {
+            return {
+                405,
+                "Method Not Allowed",
+                "text/plain; charset=utf-8",
+                "Method Not Allowed\n",
+            };
+        }
+
+        const auto html = read_file("public/index_ds.html");
+        if (!html.has_value()) {
+            return {
+                500,
+                "Internal Server Error",
+                "text/plain; charset=utf-8",
+                "Cannot open public/index.html\n",
+            };
+        }
+
+        return {
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+            *html,
+        };
+
+    }
+
+    if (request.path == "/turntable") {
+        if (request.method != "GET") {
+            return {
+                405,
+                "Method Not Allowed",
+                "text/plain; charset=utf-8",
+                "Method Not Allowed\n",
+            };
+        }
+
+        const auto html = read_file("public/tt.html");
+        if (!html.has_value()) {
+            return {
+                500,
+                "Internal Server Error",
+                "text/plain; charset=utf-8",
+                "Cannot open public/tt.html\n",
+            };
+        }
+
+        return {
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+            *html,
+        };
+
+    }
+
     if (request.path == "/hello") {
         if (request.method != "GET") {
             return {

@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🎡 决策转盘</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    /*
+     * 页面背景图开关：
+     * 1. 把图片放到 index.html 同级目录，例如 background.jpg；
+     * 2. 将下面的 none 改成 url("./background.jpg")。
+     *
+     * 如果图片放在 images 文件夹中，则写成：
+     * --page-bg-image: url("./images/background.jpg");
+     */
+    --page-bg-image: url("./background.jpg");
+
+    /*
+     * cover：保持图片比例并铺满页面，边缘可能被裁切（推荐用于背景图）；
+     * contain：完整显示图片，但页面两侧或上下可能出现空白。
+     */
+    --page-bg-size: contain;
+
+    /*
+     * 调整图片的取景中心。主体偏左可用 left center，偏右可用 right center；
+     * 也可以精确填写百分比，例如 65% center。
+     */
+    --page-bg-position: center bottom;
+    --page-bg-position-mobile: center;
+  }
+
+  body {
+    min-height: 100vh;
+    color: #5a4450;
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+
+    /* 图片还没设置或加载失败时，使用这个粉色作为备用背景。 */
+    background-color: #f9d3e3;
+
+    /*
+     * 第一层是半透明粉色蒙层，用来保证背景图较亮时文字仍然清晰；
+     * 第二层是上方 --page-bg-image 指定的图片。
+     * 如果不需要蒙层，可把两个 0.28 都改成 0。
+     */
+    background-image:
+      linear-gradient(rgba(249, 211, 227, 0.28), rgba(249, 211, 227, 0.28)),
+      var(--page-bg-image);
+    background-size: 100% 100%, var(--page-bg-size);
+    background-position: center, var(--page-bg-position);
+    background-repeat: no-repeat, no-repeat;
+    background-attachment: fixed;     /* 页面滚动时固定背景图 */
+
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+  }
+
+  /* 竖屏设备可以使用不同的取景中心，减少主体被裁掉的情况。 */
+  @media (orientation: portrait) {
+    body {
+      background-position: center, var(--page-bg-position-mobile);
+    }
+  }
+
+  .app { width: 100%; max-width: 1000px; }
+
+  header { text-align: center; margin-bottom: 36px; }
+  h1 {
+    font-size: clamp(28px, 5vw, 44px);
+    font-weight: 900;
+    background: linear-gradient(135deg, #f43f5e, #ec4899, #a855f7);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    letter-spacing: 2px;
+  }
+  .subtitle { color: #a07084; margin-top: 8px; font-size: 15px; }
+
+  .panel {
+    display: flex;
+    gap: 44px;
+    align-items: flex-start;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  /* ---------- 输入区 ---------- */
+  .input-area { flex: 1 1 280px; max-width: 400px; }
+
+  .input-area label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    color: #a07084;
+    margin-bottom: 8px;
+    letter-spacing: 1px;
+  }
+
+  textarea {
+    width: 100%;
+    min-height: 168px;
+    resize: vertical;
+    padding: 14px 16px;
+    font-size: 16px;
+    line-height: 1.8;
+    color: #5a4450;
+    background: rgba(255, 255, 255, 0.65);
+    border: 1px solid rgba(190, 24, 93, 0.22);
+    border-radius: 14px;
+    outline: none;
+    transition: border-color .2s, box-shadow .2s;
+  }
+  textarea:focus {
+    border-color: #ec4899;
+    box-shadow: 0 0 0 3px rgba(236, 72, 153, 0.22);
+  }
+  textarea:disabled { opacity: .5; }
+
+  .controls { display: flex; gap: 12px; margin-top: 16px; align-items: stretch; }
+
+  .spin-btn {
+    flex: 1;
+    padding: 14px 0;
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    color: #fff;
+    background: linear-gradient(135deg, #ec4899, #f43f5e);
+    border: none;
+    border-radius: 999px;
+    cursor: pointer;
+    box-shadow: 0 6px 22px rgba(236, 72, 153, 0.4);
+    transition: transform .1s, filter .2s, box-shadow .2s;
+  }
+  .spin-btn:hover:not(:disabled) { filter: brightness(1.1); }
+  .spin-btn:active:not(:disabled) { transform: scale(.97); }
+  .spin-btn:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
+
+  .icon-btn {
+    width: 52px;
+    font-size: 20px;
+    background: rgba(255, 255, 255, 0.5);
+    border: 1px solid rgba(190, 24, 93, 0.22);
+    border-radius: 999px;
+    cursor: pointer;
+    color: #5a4450;
+    transition: background .2s;
+  }
+  .icon-btn:hover { background: rgba(255, 255, 255, 0.85); }
+
+  .hint { min-height: 20px; margin-top: 10px; font-size: 13px; color: #e11d48; }
+
+  .tips { margin-top: 18px; font-size: 12px; color: #a07084; line-height: 1.9; }
+
+  /* ---------- 转盘区 ---------- */
+  .wheel-area {
+    flex: 0 1 480px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .wheel-wrap {
+    position: relative;
+    width: min(100%, 480px);
+    aspect-ratio: 1 / 1;
+  }
+  #wheel {
+    width: 100%;
+    height: 100%;
+    display: block;
+    will-change: transform;
+  }
+
+  .pointer {
+    position: absolute;
+    top: -8px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 0;
+    height: 0;
+    border-left: 16px solid transparent;
+    border-right: 16px solid transparent;
+    border-top: 26px solid #f43f5e;
+    filter: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.5));
+    z-index: 5;
+  }
+
+  .result {
+    margin-top: 28px;
+    padding: 16px 28px;
+    background: linear-gradient(135deg, rgba(236, 72, 153, 0.18), rgba(244, 63, 94, 0.18));
+    border: 1px solid rgba(236, 72, 153, 0.4);
+    border-radius: 18px;
+    font-size: 28px;
+    font-weight: 800;
+    text-align: center;
+    max-width: 100%;
+    opacity: 0;
+    transform: translateY(10px) scale(.95);
+    transition: opacity .35s, transform .35s cubic-bezier(.2, .9, .2, 1.3);
+    pointer-events: none;
+  }
+  .result.show { opacity: 1; transform: none; }
+
+  footer { text-align: center; margin-top: 40px; font-size: 12px; color: #b48a9a; }
+
+  /* ---------- 彩带 ---------- */
+  #confetti { position: fixed; inset: 0; z-index: 50; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<main class="app">
+  <header>
+    <h1>🎡 小媛宝宝请转转盘</h1>
+    <p class="subtitle">选择困难？把选项写上去，转一下就知道了</p>
+  </header>
+
+  <section class="panel">
+    <div class="input-area">
+      <label for="options">选项（一行一个）</label>
+      <textarea id="options" rows="6" spellcheck="false">火锅
+烤肉
+寿司
+咖喱
+面条</textarea>
+      <div class="controls">
+        <button id="spinBtn" class="spin-btn">转！</button>
+        <button id="muteBtn" class="icon-btn" title="静音">🔊</button>
+      </div>
+      <p id="hint" class="hint"></p>
+      <p class="tips">💡 指针停在哪个选项，就选哪个<br>⌨️ 输入框外按 空格 / 回车 可快速转动</p>
+    </div>
+
+    <div class="wheel-area">
+      <div class="wheel-wrap">
+        <div class="pointer"></div>
+        <canvas id="wheel"></canvas>
+      </div>
+      <div id="result" class="result"><span id="resultText"></span></div>
+    </div>
+  </section>
+</main>
+
+<canvas id="confetti"></canvas>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ==================== 状态 ==================== */
+  const SIZE = 560;                    // canvas 逻辑尺寸
+  const DPR = Math.max(1, window.devicePixelRatio || 1);
+  const PALETTE = ['#f43f5e', '#fb923c', '#fbbf24', '#34d399',
+                   '#2dd4bf', '#38bdf8', '#818cf8', '#e879f9'];
+
+  const canvas = document.getElementById('wheel');
+  const ctx = canvas.getContext('2d');
+  const confettiCanvas = document.getElementById('confetti');
+  const cctx = confettiCanvas.getContext('2d');
+
+  const ta = document.getElementById('options');
+  const spinBtn = document.getElementById('spinBtn');
+  const muteBtn = document.getElementById('muteBtn');
+  const hint = document.getElementById('hint');
+  const result = document.getElementById('result');
+  const resultText = document.getElementById('resultText');
+
+  let options = [];
+  let totalRotation = 0;               // 累计绝对旋转角（度）
+  let highlightIndex = -1;             // 中奖切片
+  let spinning = false;
+  let muted = false;
+
+  let audioCtx = null;
+
+  /* ==================== 画盘 ==================== */
+  function resizeCanvas() {
+    canvas.width = SIZE * DPR;
+    canvas.height = SIZE * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+
+  function drawWheel() {
+    resizeCanvas();
+    ctx.clearRect(0, 0, SIZE, SIZE);
+    const cx = SIZE / 2, cy = SIZE / 2;
+    const R = SIZE / 2 - 18;
+    const n = options.length;
+
+    if (n === 0) {
+      ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff'; ctx.fill();
+      ctx.fillStyle = '#b48a9a';
+      ctx.font = '20px system-ui, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('先在上方输入选项', cx, cy);
+      return;
+    }
+
+    // 把当前累计旋转 totalRotation 烘焙进像素（元素本身不再用 CSS transform）
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate((totalRotation * Math.PI) / 180);
+    ctx.translate(-cx, -cy);
+
+    const theta = (Math.PI * 2) / n;
+
+    for (let i = 0; i < n; i++) {
+      const start = -Math.PI / 2 + i * theta;
+      const end = start + theta;
+
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, R, start, end);
+      ctx.closePath();
+      ctx.fillStyle = PALETTE[i % PALETTE.length];
+      ctx.fill();
+      if (i === highlightIndex) {           // 中奖切片提亮
+        ctx.fillStyle = 'rgba(255,255,255,0.28)';
+        ctx.fill();
+      }
+      ctx.strokeStyle = 'rgba(0,0,0,0.18)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      drawSliceText(cx, cy, R, start + theta / 2, options[i], theta);
+    }
+
+    // 外圈
+    ctx.beginPath(); ctx.arc(cx, cy, R + 3, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(190, 24, 93, 0.35)';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+
+    // 中心盖帽
+    ctx.beginPath(); ctx.arc(cx, cy, 22, 0, Math.PI * 2);
+    ctx.fillStyle = '#be185d'; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  function drawSliceText(cx, cy, R, midAngle, label, theta) {
+    const flip = Math.cos(midAngle) < 0;     // 朝向左侧的切片翻转 180°，保证可读
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(flip ? midAngle + Math.PI : midAngle);
+
+    const radius = R * 0.60;
+    const tx = flip ? -radius : radius;
+
+    // 字号自适应：径向空间 & 切片宽度 & 上限
+    const maxByRadial = (R * 0.58 - 30) / Math.max(1, label.length);
+    const maxBySlice = (0.55 * R * theta) / 1.2;
+    let fontPx = Math.round(Math.max(10, Math.min(24, R * 0.11, maxByRadial, maxBySlice)));
+    if (fontPx === 10 && label.length > 12) label = label.slice(0, 12) + '…';
+
+    ctx.font = `600 ${fontPx}px system-ui, "PingFang SC", "Microsoft YaHei", sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowColor = 'rgba(0,0,0,0.5)';
+    ctx.shadowBlur = 4;
+    ctx.shadowOffsetY = 1;
+    ctx.fillText(label, tx, 0);
+    ctx.restore();
+  }
+
+  /* ==================== 随机 + 落地角度 ==================== */
+  // 几何事实：转盘顺时针转 R 度后，指针（顶部）处的盘面局部角 = (360 − R) mod 360。
+  // 局部角落在 [iθ,(i+1)θ) 即为切片 i。
+  function sliceAt(deg) {
+    const n = options.length;
+    if (n === 0) return -1;
+    const theta = 360 / n;
+    const r = ((deg % 360) + 360) % 360;
+    const local = (360 - r) % 360;
+    return Math.min(n - 1, Math.floor(local / theta));
+  }
+
+  // 目标旋转增量 delta：使 base+delta 满足 (360 − (base+delta)) mod 360 = (w+0.5)·θ
+  // → delta ≡ 360 − (w+0.5)·θ − base (mod 360)。base 是已累计的旋转，必须参与计算，
+  //   否则只有第 1 次（base=0）能正对中心，之后每次都会偏移 base mod 360 度。
+  function computeTarget(w, base) {
+    const theta = 360 / options.length;
+    const center = (w + 0.5) * theta;
+    return 6 * 360 + (((360 - center - base) % 360) + 360) % 360;
+  }
+
+  /* ==================== 音效 ==================== */
+  function ensureAudio() {
+    if (!audioCtx) {
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch (e) { audioCtx = null; }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }
+
+  function playTick() {
+    if (muted || !audioCtx) return;
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'square';
+    osc.frequency.value = 1800;
+    gain.gain.setValueAtTime(0.06, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t); osc.stop(t + 0.04);
+  }
+
+  function playDing() {
+    if (muted || !audioCtx) return;
+    const t = audioCtx.currentTime;
+    [523.25, 783.99, 1046.5].forEach((f, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      const tt = t + i * 0.12;
+      gain.gain.setValueAtTime(0.0001, tt);
+      gain.gain.exponentialRampToValueAtTime(0.15, tt + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, tt + 0.6);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(tt); osc.stop(tt + 0.65);
+    });
+  }
+
+  /* ==================== 转动 ==================== */
+  function spin() {
+    const n = options.length;
+    if (n === 0 || spinning) return;
+    ensureAudio();
+
+    spinning = true;
+    spinBtn.disabled = true;
+    ta.disabled = true;
+    spinBtn.textContent = '转动中…';
+    hideResult();
+
+    if (n === 1) {                       // 单个选项：直接出结果
+      highlightIndex = 0;
+      drawWheel();
+      showResult(options[0]);
+      finish();
+      return;
+    }
+
+    const winner = Math.floor(Math.random() * n);
+    const delta = computeTarget(winner, totalRotation);   // 感知当前基准，保证落点正对中心
+    const duration = 4200;
+    const t0 = performance.now();
+    let lastSlice = sliceAt(totalRotation);
+
+    function frame(now) {
+      const p = Math.min(1, (now - t0) / duration);
+      const eased = 1 - Math.pow(1 - p, 5);              // easeOutQuint
+      const d = delta * eased;                           // 已转的增量
+      canvas.style.transform = `rotate(${d}deg)`;        // 在已烘焙像素之上再转
+
+      const s = sliceAt(totalRotation + d);
+      if (s !== lastSlice) { lastSlice = s; playTick(); }
+
+      if (p < 1) {
+        requestAnimationFrame(frame);
+      } else {
+        totalRotation += delta;
+        canvas.style.transform = 'none';                 // 复位临时变换
+        highlightIndex = winner;
+        drawWheel();                                     // 把最终角度烘焙进像素
+        showResult(options[winner]);
+        playDing();
+        finish();
+      }
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function finish() {
+    spinning = false;
+    spinBtn.disabled = false;
+    ta.disabled = false;
+    spinBtn.textContent = '转！';
+  }
+
+  /* ==================== 结果 + 彩带 ==================== */
+  function showResult(text) {
+    resultText.textContent = '🎉 ' + text + ' 🎉';
+    result.classList.add('show');
+    burstConfetti();
+  }
+  function hideResult() { result.classList.remove('show'); }
+
+  function resizeConfetti() {
+    confettiCanvas.width = innerWidth * DPR;
+    confettiCanvas.height = innerHeight * DPR;
+    cctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+
+  let pieces = [];
+  let confettiRunning = false;
+
+  function burstConfetti() {
+    pieces = [];
+    const colors = PALETTE;
+    for (let i = 0; i < 120; i++) {
+      pieces.push({
+        x: innerWidth / 2,
+        y: innerHeight * 0.32,
+        vx: (Math.random() - 0.5) * 14,
+        vy: Math.random() * -12 - 4,
+        w: Math.random() * 8 + 4,
+        h: Math.random() * 8 + 4,
+        rot: Math.random() * Math.PI,
+        vr: (Math.random() - 0.5) * 0.3,
+        color: colors[i % colors.length],
+        life: 0
+      });
+    }
+    if (!confettiRunning) runConfetti();
+  }
+
+  function runConfetti() {
+    confettiRunning = true;
+    cctx.clearRect(0, 0, innerWidth, innerHeight);
+    for (const p of pieces) {
+      p.life++;
+      p.vy += 0.35;
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vx *= 0.985;
+      p.rot += p.vr;
+    }
+    pieces = pieces.filter(p => p.y < innerHeight + 50 && p.life < 240);
+    for (const p of pieces) {
+      cctx.save();
+      cctx.translate(p.x, p.y);
+      cctx.rotate(p.rot);
+      cctx.fillStyle = p.color;
+      cctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+      cctx.restore();
+    }
+    if (pieces.length) {
+      requestAnimationFrame(runConfetti);
+    } else {
+      confettiRunning = false;
+      cctx.clearRect(0, 0, innerWidth, innerHeight);
+    }
+  }
+
+  /* ==================== 输入 & 事件 ==================== */
+  let debounce;
+  ta.addEventListener('input', () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(updateOptions, 150);
+  });
+
+  function updateOptions() {
+    options = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+    highlightIndex = -1;
+    hideResult();
+    drawWheel();
+    hint.textContent = options.length === 0 ? '请至少输入一个选项' : '';
+    if (!spinning) spinBtn.disabled = options.length === 0;
+  }
+
+  spinBtn.addEventListener('click', spin);
+
+  muteBtn.addEventListener('click', () => {
+    muted = !muted;
+    muteBtn.textContent = muted ? '🔇' : '🔊';
+    muteBtn.title = muted ? '开启声音' : '静音';
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.key === ' ' || e.key === 'Enter') {
+      if (document.activeElement === ta) return;   // 输入框内留空格/换行
+      e.preventDefault();
+      spin();
+    }
+  });
+
+  window.addEventListener('resize', resizeConfetti);
+
+  /* ==================== 初始化 ==================== */
+  resizeConfetti();
+  updateOptions();
+})();
+</script>
+</body>
+</html>
