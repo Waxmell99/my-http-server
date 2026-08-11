@@ -12,6 +12,8 @@ enum class HttpParseResult {
     complete,
     bad_request,
     payload_too_large,
+    version_not_supported,
+    expectation_failed,
 };
 
 // HTTP Header 名会在解析时统一转换为小写。

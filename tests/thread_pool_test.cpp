@@ -3,6 +3,7 @@
 #include <atomic>
 #include <future>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 
 namespace {
@@ -74,11 +75,33 @@ void test_queue_capacity() {
            "execute the queued task during graceful shutdown");
 }
 
+void test_invalid_inputs() {
+    bool rejected_worker_count = false;
+    try {
+        personal_cloud::ThreadPool pool(0, 1);
+    } catch (const std::invalid_argument&) {
+        rejected_worker_count = true;
+    }
+    expect(rejected_worker_count, "reject a zero worker count");
+
+    bool rejected_queue_size = false;
+    try {
+        personal_cloud::ThreadPool pool(1, 0);
+    } catch (const std::invalid_argument&) {
+        rejected_queue_size = true;
+    }
+    expect(rejected_queue_size, "reject a zero queue capacity");
+
+    personal_cloud::ThreadPool pool(1, 1);
+    expect(!pool.submit({}), "reject an empty task");
+}
+
 }  // namespace
 
 int main() {
     test_executes_all_tasks();
     test_queue_capacity();
+    test_invalid_inputs();
 
     if (failure_count != 0) {
         std::cerr << failure_count << " test assertion(s) failed.\n";

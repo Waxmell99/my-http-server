@@ -18,11 +18,11 @@ struct ReceiveResult {
     std::size_t bytes_received;
 };
 
-// 创建、绑定并开始监听一个 TCP Socket。
+// 创建、绑定并开始监听一个 nonblocking、close-on-exec TCP Socket。
 // 成功时返回 Socket 文件描述符，失败时返回 -1。
 int create_listening_socket(std::uint16_t port, int backlog);
 
-// 等待并接受一个客户端连接。
+// 接受一个 nonblocking、close-on-exec 客户端连接。
 // 成功时返回客户端 Socket 文件描述符，失败时返回 -1。
 int accept_client(int listening_fd);
 

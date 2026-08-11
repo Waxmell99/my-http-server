@@ -9,7 +9,7 @@
 namespace personal_cloud {
 namespace {
 
-bool is_header_name_character(char character) {
+bool is_token_character(char character) {
     if ((character >= 'a' && character <= 'z') ||
         (character >= 'A' && character <= 'Z') ||
         (character >= '0' && character <= '9')) {
@@ -18,6 +18,49 @@ bool is_header_name_character(char character) {
 
     constexpr std::string_view symbols = "!#$%&'*+-.^_`|~";
     return symbols.find(character) != std::string_view::npos;
+}
+
+bool is_valid_request_target(std::string_view target) {
+    for (char character : target) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte <= 0x20U || byte >= 0x7fU || character == '#') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool is_valid_header_value(std::string_view value) {
+    for (char character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (character != '\t' && (byte < 0x20U || byte == 0x7fU)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool has_valid_http_version_syntax(std::string_view version) {
+    return version.size() == 8 && version.substr(0, 5) == "HTTP/" &&
+           version[5] >= '0' && version[5] <= '9' &&
+           version[6] == '.' &&
+           version[7] >= '0' && version[7] <= '9';
+}
+
+bool is_valid_host(std::string_view value) {
+    if (value.empty()) {
+        return false;
+    }
+
+    for (char character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte <= 0x20U || byte >= 0x7fU) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string lowercase_header_name(std::string_view name) {
@@ -85,11 +128,19 @@ HttpParseResult parse_http_request(
                             second_space - first_space - 1);
     const std::string_view version = request_line.substr(second_space + 1);
 
-    constexpr std::string_view http_prefix = "HTTP/";
-    if (version.size() < http_prefix.size() ||
-        version.find(' ') != std::string_view::npos ||
-        version.substr(0, http_prefix.size()) != http_prefix) {
+    for (char character : method) {
+        if (!is_token_character(character)) {
+            return HttpParseResult::bad_request;
+        }
+    }
+
+    if (!is_valid_request_target(path) ||
+        !has_valid_http_version_syntax(version)) {
         return HttpParseResult::bad_request;
+    }
+
+    if (version != "HTTP/1.0" && version != "HTTP/1.1") {
+        return HttpParseResult::version_not_supported;
     }
 
     HttpRequest parsed_request;
@@ -113,14 +164,19 @@ HttpParseResult parse_http_request(
 
         const std::string_view raw_name = line.substr(0, colon);
         for (char character : raw_name) {
-            if (!is_header_name_character(character)) {
+            if (!is_token_character(character)) {
                 return HttpParseResult::bad_request;
             }
         }
 
+        const std::string_view raw_value = line.substr(colon + 1);
+        if (!is_valid_header_value(raw_value)) {
+            return HttpParseResult::bad_request;
+        }
+
         std::string name = lowercase_header_name(raw_name);
         const std::string_view value =
-            trim_optional_whitespace(line.substr(colon + 1));
+            trim_optional_whitespace(raw_value);
 
         if (parsed_request.headers.contains(name)) {
             return HttpParseResult::bad_request;
@@ -128,6 +184,13 @@ HttpParseResult parse_http_request(
 
         parsed_request.headers.emplace(std::move(name), std::string(value));
         line_start = line_end + 2;
+    }
+
+    const auto host_header = parsed_request.headers.find("host");
+    if (version == "HTTP/1.1" &&
+        (host_header == parsed_request.headers.end() ||
+         !is_valid_host(host_header->second))) {
+        return HttpParseResult::bad_request;
     }
 
     if (parsed_request.headers.contains("transfer-encoding")) {
@@ -153,6 +216,14 @@ HttpParseResult parse_http_request(
 
     if (content_length > maximum_body_size) {
         return HttpParseResult::payload_too_large;
+    }
+
+    if (version == "HTTP/1.1" &&
+        parsed_request.headers.contains("expect")) {
+        // The server does not implement the 100-continue interim-response
+        // state, so it must send a final response instead of deadlocking with
+        // a client that waits before transmitting its body.
+        return HttpParseResult::expectation_failed;
     }
 
     const std::size_t body_start = headers_end + 4;

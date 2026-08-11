@@ -26,6 +26,7 @@ target_include_directories(http_server
     PRIVATE
         "${PROJECT_SOURCE_DIR}/include"
 )
+target_link_libraries(http_server PRIVATE Threads::Threads)
 
 # GCC 和 Clang 使用的常见警告选项。
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -64,6 +65,9 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME http_tests COMMAND http_tests)
+    set_tests_properties(http_tests PROPERTIES
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    )
 
     add_executable(thread_pool_tests
         tests/thread_pool_test.cpp
@@ -87,4 +91,32 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME thread_pool_tests COMMAND thread_pool_tests)
+
+    add_executable(server_integration_tests
+        tests/server_integration_test.cpp
+        src/epoll_server.cpp
+        src/http_server.cpp
+        src/http_request.cpp
+        src/http_response.cpp
+        src/router.cpp
+    )
+
+    target_compile_features(server_integration_tests PRIVATE cxx_std_20)
+    target_include_directories(server_integration_tests
+        PRIVATE
+            "${PROJECT_SOURCE_DIR}/include"
+    )
+    target_link_libraries(server_integration_tests PRIVATE Threads::Threads)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(server_integration_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    add_test(NAME server_integration_tests COMMAND server_integration_tests)
+    set_tests_properties(server_integration_tests PROPERTIES TIMEOUT 15)
 endif()

@@ -3,8 +3,9 @@
 这是一个用于学习 Linux 网络编程和 HTTP 的 C++ 项目。
 
 当前进度：已经完成非阻塞 Socket、epoll 事件循环、HTTP Request/Response、
-路由、超时清理和单元测试。服务器使用单线程 epoll 管理大量连接，不会让一个
-慢客户端阻塞其他客户端。请求解析器支持 Header、`Content-Length` 和 Body，
+路由、超时清理、优雅停机和端到端测试。服务器使用单线程 epoll 管理大量连接，
+不会让一个慢客户端阻塞其他客户端。请求解析器支持 Header、`Content-Length`
+和 Body，并严格检查 HTTP/1.x 请求行、Host、Header 控制字符和消息长度。
 服务器可以处理 GET，以及在内存中接收简单的 `text/plain` POST 内容。
 
 ## 当前结构
@@ -29,7 +30,7 @@
 ├── src/
 │   ├── client_handler.cpp  # 旧阻塞式客户端处理流程（学习对照）
 │   ├── epoll_server.cpp    # 非阻塞收发、连接状态和 epoll 事件循环
-│   ├── http_request.cpp    # 简单 HTTP 请求行解析
+│   ├── http_request.cpp    # HTTP/1.x 请求解析和消息边界检查
 │   ├── http_response.cpp   # HTTP 响应序列化
 │   ├── http_server.cpp     # Socket 层系统调用及错误处理
 │   ├── router.cpp          # method/path 匹配和响应生成
@@ -37,6 +38,7 @@
 │   └── main.cpp            # 设置参数并启动 epoll 服务器
 └── tests/
     ├── http_test.cpp        # Request、Router 和 Response 测试
+    ├── server_integration_test.cpp # 真实 Socket/epoll 端到端测试
     └── thread_pool_test.cpp # 任务执行、队列容量和停止测试
 ```
 
@@ -57,6 +59,7 @@ ctest --test-dir build --output-on-failure
 
 ```bash
 ./build/http_tests
+./build/server_integration_tests
 ./build/thread_pool_tests
 ```
 
@@ -73,6 +76,8 @@ ctest --test-dir build --output-on-failure
 ```bash
 ./build/http_server
 ```
+
+页面文件目前按相对路径从 `public/` 读取，因此应从项目根目录运行上述命令。
 
 在另一个终端使用 netcat 连接：
 
@@ -96,8 +101,14 @@ Response sent; closing client fd = 5
 ```
 
 当前采用单线程 epoll 边缘触发（ET）模型。监听 Socket 和客户端 Socket 都是
-非阻塞的；`recv()` 和 `send()` 会一直处理到返回 `EAGAIN`，然后把执行权交还
-给事件循环。每个连接只处理一个请求，响应头会发送 `Connection: close`。
+非阻塞且带 `close-on-exec` 标志；`recv()` 和 `send()` 会一直处理到返回
+`EAGAIN`，然后把执行权交还给事件循环。监听 Socket 还使用 `EPOLLONESHOT`，
+每次把 accept 队列排空后显式重新启用，避免文件描述符耗尽时丢失 ET 通知。
+每个连接只处理一个请求，响应头会发送 `Connection: close`。
+
+使用 Ctrl-C 或发送 SIGTERM 时，信号会通过 Linux `signalfd` 进入 epoll 事件
+循环。服务器正常退出并关闭监听 Socket、epoll fd、信号 fd 和所有客户端
+Socket，而不是直接被默认信号动作终止。
 
 发送文本 POST：
 
@@ -116,29 +127,45 @@ hello upload
 ```
 
 当前 `/upload` 只在内存中接收并回显文本，不会写入磁盘。Header 限制为
-16 KiB，Body 限制为 64 KiB。
+16 KiB，Body 限制为 64 KiB。媒体类型名称不区分大小写，并允许参数前的可选
+空白；例如 `Text/Plain ; charset=utf-8` 可以正常处理。
+
+当前支持 HTTP/1.0 和 HTTP/1.1。HTTP/1.1 必须提供非空 `Host`；不合法请求
+返回 `400`，不支持的版本返回 `505`，过大的 Body/Header 分别返回 `413` 和
+`431`。服务器还没有实现 `100 Continue` 中间响应，因此带 `Expect` 的
+HTTP/1.1 请求会立即返回 `417`，避免客户端和服务器互相等待。已知路由的
+`405` 响应会带正确的 `Allow` Header，查询字符串不会影响路由路径匹配。
 
 事件循环记录每个连接最后一次成功收发数据的时间。接收阶段空闲 30 秒时返回
 `408 Request Timeout`；发送阶段空闲 30 秒时直接关闭连接。超时检查每秒最多
 执行一次，避免高并发时为每一批事件重复扫描连接表。
 
+事件循环保留一个指向 `/dev/null` 的文件描述符。当进程遇到 `EMFILE` 或系统
+遇到 `ENFILE` 时，会用该保留槽接受并关闭一个排队连接、暂停监听，然后在
+现有客户端关闭或一秒重试点重新启用监听，避免 ET 监听 Socket 永久卡住。
+此外，`maximum_connections` 默认把活动连接限制为 10000；达到限制后仍会排空
+accept 队列，但会立即关闭超出的连接，防止连接状态无界增长。
+
 ## 当前模块关系
 
 阅读各文件之间的关系：
 
-1. `http_server.h/.cpp` 创建 Socket，并提供非阻塞模式设置等基础能力。
+1. `http_server.h/.cpp` 原子创建 nonblocking/close-on-exec Socket，并提供旧
+   阻塞模型仍会使用的基础收发能力。
 2. `http_request.h/.cpp` 解析请求行、Header、`Content-Length` 和 Body。
 3. `router.h/.cpp` 根据 method 和 path 选择响应。
 4. `http_response.h/.cpp` 把响应对象序列化为 HTTP 文本。
-5. `epoll_server.h/.cpp` 保存每个连接的接收/发送状态，并调度非阻塞 IO。
+5. `epoll_server.h/.cpp` 保存每个连接的接收/发送状态，调度非阻塞 IO，处理
+   信号停机和描述符耗尽恢复。
 6. `main.cpp` 配置端口、backlog、事件数组和空闲超时，然后启动事件循环。
 7. `client_handler` 和 `thread_pool` 保留作为旧并发模型的学习对照，不参与
    `http_server` 可执行程序的构建。
 
 当前接口包括：
 
-- `create_listening_socket()`：创建、绑定并监听。
-- `accept_client()`：接受一个客户端连接。
+- `create_listening_socket()`：创建、绑定并监听，原子设置 nonblocking 和
+  close-on-exec。
+- `accept_client()`：通过 `accept4()` 接受客户端并原子设置相同标志。
 - `set_socket_nonblocking()`：使用 `fcntl()` 设置 `O_NONBLOCK`。
 - `set_socket_timeouts()`：设置客户端 Socket 的收发超时。
 - `receive_data()`：返回数据、对端关闭、超时或普通错误状态。
@@ -153,10 +180,12 @@ hello upload
 - 为什么 `send_all()` 需要循环调用 `send()`。
 - 为什么 ET 模式下必须一直 `accept()`、`recv()` 或 `send()` 到 `EAGAIN`。
 - 为什么连接状态中需要分别保存请求缓冲区、响应缓冲区和发送偏移量。
+- 为什么 `EMFILE` 时需要保留 fd、暂停监听和显式重新启用 one-shot 事件。
+- 为什么用 `signalfd` 可以让信号处理保持在普通同步代码中。
 
-下一步可以补充 SIGINT/SIGTERM 优雅停机、自动化并发压力测试和 HTTP
-Keep-Alive。如果路由中出现耗时磁盘或计算任务，再考虑把 epoll 与工作线程池
-组合，而不是在事件循环中执行耗时操作。
+下一步可以补充可重复的高并发压力测试、HTTP Keep-Alive 和可配置的文档根
+目录。如果路由中出现耗时磁盘或计算任务，再考虑把 epoll 与工作线程池组合，
+而不是在事件循环中执行耗时操作。
 
 ## 学习约定
 

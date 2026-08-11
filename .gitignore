@@ -1,6 +1,7 @@
 /build/
+/build-sanitize/
+/build-analyzer/
 /data/
 *.log
 compile_commands.json
 .env
-

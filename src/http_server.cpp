@@ -10,9 +10,31 @@
 #include <unistd.h>
 
 namespace personal_cloud {
+namespace {
+
+bool is_transient_accept_error(int error) noexcept {
+    switch (error) {
+        case ECONNABORTED:
+        case ENETDOWN:
+        case EPROTO:
+        case ENOPROTOOPT:
+        case EHOSTDOWN:
+        case ENONET:
+        case EHOSTUNREACH:
+        case EOPNOTSUPP:
+        case ENETUNREACH:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+}  // namespace
 
 int create_listening_socket(std::uint16_t port, int backlog) {
-    const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int socket_fd = ::socket(
+        AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (socket_fd == -1) {
         std::perror("socket");
         return -1;
@@ -52,17 +74,26 @@ int create_listening_socket(std::uint16_t port, int backlog) {
 }
 
 int accept_client(int listening_fd) {
-    int client_fd = -1;
+    while (true) {
+        const int client_fd = ::accept4(
+            listening_fd,
+            nullptr,
+            nullptr,
+            SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (client_fd >= 0) {
+            return client_fd;
+        }
 
-    do {
-        client_fd = ::accept(listening_fd, nullptr, nullptr);
-    } while (client_fd == -1 && errno == EINTR);
+        if (errno == EINTR || is_transient_accept_error(errno)) {
+            continue;
+        }
 
-    if (client_fd == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        std::perror("accept");
+        if (errno != EAGAIN && errno != EWOULDBLOCK &&
+            errno != EMFILE && errno != ENFILE) {
+            std::perror("accept4");
+        }
+        return -1;
     }
-
-    return client_fd;
 }
 
 bool set_socket_nonblocking(int socket_fd) {

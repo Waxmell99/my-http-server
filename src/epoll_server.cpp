@@ -12,14 +12,19 @@
 #include <cstdio>
 #include <iostream>
 #include <limits>
+#include <pthread.h>
+#include <signal.h>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 namespace personal_cloud {
 namespace {
@@ -30,12 +35,21 @@ constexpr std::size_t maximum_body_size = 64 * 1024;
 constexpr std::string_view header_terminator = "\r\n\r\n";
 constexpr int epoll_wait_timeout_milliseconds = 1000;
 constexpr std::chrono::seconds timeout_check_interval{1};
+constexpr std::chrono::seconds accept_retry_interval{1};
+constexpr std::uint32_t listening_event_flags =
+    EPOLLIN | EPOLLET | EPOLLONESHOT;
 
 using Clock = std::chrono::steady_clock;
 
 enum class ConnectionState {
     receiving,
     sending,
+};
+
+enum class SignalReadResult {
+    no_signal,
+    termination_requested,
+    error,
 };
 
 struct ClientConnection {
@@ -60,8 +74,8 @@ HttpResponse make_error_response(
 
 class EpollEventLoop final {
 public:
-    explicit EpollEventLoop(EpollServerConfig config)
-        : config_(std::move(config)) {}
+    EpollEventLoop(EpollServerConfig config, std::stop_token stop_token)
+        : config_(std::move(config)), stop_token_(stop_token) {}
 
     ~EpollEventLoop() {
         for (const auto& [client_fd, connection] : clients_) {
@@ -71,6 +85,17 @@ public:
 
         close_socket(listening_fd_);
         close_socket(epoll_fd_);
+        close_socket(signal_fd_);
+        close_socket(reserve_fd_);
+
+        if (signal_mask_changed_) {
+            const int mask_error = ::pthread_sigmask(
+                SIG_SETMASK, &previous_signal_mask_, nullptr);
+            if (mask_error != 0) {
+                errno = mask_error;
+                std::perror("restore signal mask");
+            }
+        }
     }
 
     EpollEventLoop(const EpollEventLoop&) = delete;
@@ -81,7 +106,7 @@ public:
             return 1;
         }
 
-        while (true) {
+        while (!stop_token_.stop_requested()) {
             const int ready_count = ::epoll_wait(
                 epoll_fd_,
                 events_.data(),
@@ -102,7 +127,30 @@ public:
                 const int socket_fd = event.data.fd;
 
                 if (socket_fd == listening_fd_) {
-                    accept_ready_clients();
+                    if (!accept_ready_clients()) {
+                        return 1;
+                    }
+                    continue;
+                }
+
+                if (socket_fd == signal_fd_) {
+                    if ((event.events & (EPOLLERR | EPOLLHUP)) != 0U) {
+                        write_log(
+                            std::cerr,
+                            "Termination signal descriptor failed.\n");
+                        return 1;
+                    }
+                    if ((event.events & EPOLLIN) != 0U) {
+                        const SignalReadResult signal_result =
+                            consume_termination_signal();
+                        if (signal_result ==
+                            SignalReadResult::termination_requested) {
+                            return 0;
+                        }
+                        if (signal_result == SignalReadResult::error) {
+                            return 1;
+                        }
+                    }
                     continue;
                 }
 
@@ -110,12 +158,16 @@ public:
             }
 
             remove_idle_clients();
+            retry_paused_accepts();
         }
+
+        return 0;
     }
 
 private:
     bool initialize() {
         if (config_.backlog <= 0 || config_.maximum_events == 0 ||
+            config_.maximum_connections == 0 ||
             config_.maximum_events >
                 static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             config_.idle_timeout <= std::chrono::seconds::zero()) {
@@ -123,13 +175,19 @@ private:
             return false;
         }
 
-        listening_fd_ = create_listening_socket(
-            config_.port, config_.backlog);
-        if (listening_fd_ == -1) {
+        if (!setup_termination_signals()) {
             return false;
         }
 
-        if (!set_socket_nonblocking(listening_fd_)) {
+        reserve_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (reserve_fd_ == -1) {
+            std::perror("open reserve descriptor");
+            return false;
+        }
+
+        listening_fd_ = create_listening_socket(
+            config_.port, config_.backlog);
+        if (listening_fd_ == -1) {
             return false;
         }
 
@@ -140,7 +198,7 @@ private:
         }
 
         epoll_event listening_event {};
-        listening_event.events = EPOLLIN | EPOLLET;
+        listening_event.events = listening_event_flags;
         listening_event.data.fd = listening_fd_;
         if (::epoll_ctl(
                 epoll_fd_,
@@ -149,6 +207,20 @@ private:
                 &listening_event) == -1) {
             std::perror("epoll_ctl add listening Socket");
             return false;
+        }
+
+        if (signal_fd_ >= 0) {
+            epoll_event signal_event {};
+            signal_event.events = EPOLLIN;
+            signal_event.data.fd = signal_fd_;
+            if (::epoll_ctl(
+                    epoll_fd_,
+                    EPOLL_CTL_ADD,
+                    signal_fd_,
+                    &signal_event) == -1) {
+                std::perror("epoll_ctl add termination signal descriptor");
+                return false;
+            }
         }
 
         events_.resize(config_.maximum_events);
@@ -162,19 +234,100 @@ private:
         return true;
     }
 
-    void accept_ready_clients() {
+    bool setup_termination_signals() {
+        if (!config_.handle_termination_signals) {
+            return true;
+        }
+
+        sigset_t termination_signals;
+        if (::sigemptyset(&termination_signals) == -1 ||
+            ::sigaddset(&termination_signals, SIGINT) == -1 ||
+            ::sigaddset(&termination_signals, SIGTERM) == -1) {
+            std::perror("configure termination signal mask");
+            return false;
+        }
+
+        const int mask_error = ::pthread_sigmask(
+            SIG_BLOCK,
+            &termination_signals,
+            &previous_signal_mask_);
+        if (mask_error != 0) {
+            errno = mask_error;
+            std::perror("pthread_sigmask");
+            return false;
+        }
+        signal_mask_changed_ = true;
+
+        signal_fd_ = ::signalfd(
+            -1,
+            &termination_signals,
+            SFD_NONBLOCK | SFD_CLOEXEC);
+        if (signal_fd_ == -1) {
+            std::perror("signalfd");
+            return false;
+        }
+        return true;
+    }
+
+    SignalReadResult consume_termination_signal() {
+        while (true) {
+            signalfd_siginfo signal_info {};
+            const ssize_t received = ::read(
+                signal_fd_, &signal_info, sizeof(signal_info));
+            if (received == static_cast<ssize_t>(sizeof(signal_info))) {
+                if (signal_info.ssi_signo == SIGINT ||
+                    signal_info.ssi_signo == SIGTERM) {
+                    return SignalReadResult::termination_requested;
+                }
+                continue;
+            }
+
+            if (received == -1 && errno == EINTR) {
+                continue;
+            }
+            if (received == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return SignalReadResult::no_signal;
+            }
+
+            if (received == -1) {
+                std::perror("read signalfd");
+            } else {
+                write_log(
+                    std::cerr,
+                    "Short read from termination signal descriptor.\n");
+            }
+            return SignalReadResult::error;
+        }
+    }
+
+    bool accept_ready_clients() {
         while (true) {
             const int client_fd = accept_client(listening_fd_);
             if (client_fd == -1) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    return;
+                    return rearm_listening_socket();
                 }
 
-                // accept_client 已经输出了真正的系统错误；本次就绪事件到此结束。
-                return;
+                if (errno == EMFILE || errno == ENFILE) {
+                    recover_from_descriptor_exhaustion();
+                    accepting_paused_ = true;
+                    next_accept_retry_ = Clock::now() + accept_retry_interval;
+                    return true;
+                }
+
+                // accept_client 已经输出了真正的系统错误。
+                return false;
             }
 
-            if (!set_socket_nonblocking(client_fd)) {
+            if (clients_.size() >= config_.maximum_connections) {
+                if (config_.verbose_logging) {
+                    write_log(
+                        std::cerr,
+                        "Connection limit reached; rejecting fd = ",
+                        client_fd,
+                        '\n');
+                }
                 close_socket(client_fd);
                 continue;
             }
@@ -203,6 +356,60 @@ private:
                 write_log(
                     std::cout, "Client connected, fd = ", client_fd, '\n');
             }
+        }
+    }
+
+    bool rearm_listening_socket() {
+        epoll_event listening_event {};
+        listening_event.events = listening_event_flags;
+        listening_event.data.fd = listening_fd_;
+        if (::epoll_ctl(
+                epoll_fd_,
+                EPOLL_CTL_MOD,
+                listening_fd_,
+                &listening_event) == -1) {
+            std::perror("epoll_ctl rearm listening Socket");
+            return false;
+        }
+        return true;
+    }
+
+    void recover_from_descriptor_exhaustion() {
+        write_log(
+            std::cerr,
+            "File descriptor limit reached; pausing accepts.\n");
+
+        close_socket(reserve_fd_);
+        reserve_fd_ = -1;
+
+        const int rejected_fd = accept_client(listening_fd_);
+        close_socket(rejected_fd);
+
+        reserve_fd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (reserve_fd_ == -1) {
+            std::perror("reopen reserve descriptor");
+        }
+    }
+
+    void retry_paused_accepts() {
+        if (!accepting_paused_ || Clock::now() < next_accept_retry_) {
+            return;
+        }
+
+        if (rearm_listening_socket()) {
+            accepting_paused_ = false;
+        } else {
+            next_accept_retry_ = Clock::now() + accept_retry_interval;
+        }
+    }
+
+    void resume_paused_accepts() {
+        if (!accepting_paused_) {
+            return;
+        }
+
+        if (rearm_listening_socket()) {
+            accepting_paused_ = false;
         }
     }
 
@@ -297,6 +504,37 @@ private:
                             413,
                             "Payload Too Large",
                             "Payload Too Large\n"));
+                }
+
+                if (parse_result ==
+                    HttpParseResult::version_not_supported) {
+                    write_log(
+                        std::cerr,
+                        "HTTP version is not supported, fd = ",
+                        client_fd,
+                        '\n');
+                    return queue_response(
+                        client_fd,
+                        connection,
+                        make_error_response(
+                            505,
+                            "HTTP Version Not Supported",
+                            "HTTP Version Not Supported\n"));
+                }
+
+                if (parse_result == HttpParseResult::expectation_failed) {
+                    write_log(
+                        std::cerr,
+                        "HTTP expectation is not supported, fd = ",
+                        client_fd,
+                        '\n');
+                    return queue_response(
+                        client_fd,
+                        connection,
+                        make_error_response(
+                            417,
+                            "Expectation Failed",
+                            "Expectation Failed\n"));
                 }
 
                 if (config_.verbose_logging) {
@@ -471,20 +709,30 @@ private:
             epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr));
         clients_.erase(client_fd);
         close_socket(client_fd);
+        resume_paused_accepts();
     }
 
     EpollServerConfig config_;
+    std::stop_token stop_token_;
     int listening_fd_{-1};
     int epoll_fd_{-1};
+    int signal_fd_{-1};
+    int reserve_fd_{-1};
+    sigset_t previous_signal_mask_ {};
+    bool signal_mask_changed_{false};
+    bool accepting_paused_{false};
     std::vector<epoll_event> events_;
     std::unordered_map<int, ClientConnection> clients_;
     Clock::time_point next_timeout_check_{Clock::now()};
+    Clock::time_point next_accept_retry_{Clock::now()};
 };
 
 }  // namespace
 
-int run_epoll_server(const EpollServerConfig& config) {
-    EpollEventLoop event_loop(config);
+int run_epoll_server(
+    const EpollServerConfig& config,
+    std::stop_token stop_token) {
+    EpollEventLoop event_loop(config, stop_token);
     return event_loop.run();
 }
 

@@ -70,11 +70,120 @@ void test_invalid_requests() {
            "reject an invalid Content-Length");
 }
 
+void test_protocol_validation() {
+    personal_cloud::HttpRequest request;
+
+    expect(personal_cloud::parse_http_request(
+               "GET /hello HTTP/1.1\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "require Host for HTTP/1.1");
+
+    expect(personal_cloud::parse_http_request(
+               "GET /hello HTTP/1.1\r\nHost:\t \r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject an empty HTTP/1.1 Host");
+
+    expect(personal_cloud::parse_http_request(
+               "GET /hello HTTP/1.1\r\nHost: local host\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject whitespace inside an HTTP/1.1 Host");
+
+    expect(personal_cloud::parse_http_request(
+               "GET /hello HTTP/1.0\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::complete,
+           "allow HTTP/1.0 without Host");
+
+    expect(personal_cloud::parse_http_request(
+               "G@T /hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject a method containing a non-token character");
+
+    expect(personal_cloud::parse_http_request(
+               "GET /hello#fragment HTTP/1.1\r\n"
+               "Host: localhost\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject a fragment in the request target");
+
+    expect(personal_cloud::parse_http_request(
+               "GET /hello HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "X-Test: ok" "\x01" "bad\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject a control character in a Header value");
+
+    expect(personal_cloud::parse_http_request(
+               "GET /hello HTTP/2.0\r\nHost: localhost\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::version_not_supported,
+           "distinguish a valid but unsupported HTTP version");
+
+    expect(personal_cloud::parse_http_request(
+               "GET /hello HTTP/1.01\r\nHost: localhost\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject malformed HTTP version syntax");
+
+    expect(personal_cloud::parse_http_request(
+               "POST /upload HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "Content-Length: 5\r\n"
+               "Expect: 100-continue\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::expectation_failed,
+           "reject unsupported expectations without waiting for the body");
+
+    expect(personal_cloud::parse_http_request(
+               "POST /upload HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "Content-Length: 1\r\n"
+               "Content-Length: 1\r\n\r\nx",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject duplicate Content-Length framing");
+
+    expect(personal_cloud::parse_http_request(
+               "POST /upload HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "Transfer-Encoding: chunked\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject unsupported Transfer-Encoding framing");
+
+    expect(personal_cloud::parse_http_request(
+               "POST /upload HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "Content-Length: 999999999999999999999999999999\r\n\r\n",
+               request,
+               maximum_body_size) ==
+               personal_cloud::HttpParseResult::bad_request,
+           "reject an overflowing Content-Length");
+}
+
 void test_request_body() {
     personal_cloud::HttpRequest request;
     const personal_cloud::HttpParseResult complete =
         personal_cloud::parse_http_request(
             "POST /upload HTTP/1.1\r\n"
+            "Host: localhost\r\n"
             "Content-Type: text/plain; charset=utf-8\r\n"
             "Content-Length: 11\r\n"
             "\r\n"
@@ -92,6 +201,7 @@ void test_request_body() {
     const personal_cloud::HttpParseResult incomplete =
         personal_cloud::parse_http_request(
             "POST /upload HTTP/1.1\r\n"
+            "Host: localhost\r\n"
             "Content-Length: 5\r\n\r\nabc",
             request,
             maximum_body_size);
@@ -101,6 +211,7 @@ void test_request_body() {
     const personal_cloud::HttpParseResult too_large =
         personal_cloud::parse_http_request(
             "POST /upload HTTP/1.1\r\n"
+            "Host: localhost\r\n"
             "Content-Length: 5\r\n\r\n",
             request,
             4);
@@ -120,12 +231,27 @@ void test_routing() {
     expect(response.body == "OK\n", "GET /health returns its body");
 
     response = personal_cloud::route_request(
+        {"GET", "/health?verbose=true", "HTTP/1.1", {}, {}});
+    expect(response.status_code == 200,
+           "route using the path portion before a query string");
+
+    response = personal_cloud::route_request(
+        {"GET", "/", "HTTP/1.1", {}, {}});
+    expect(response.status_code == 200, "GET / returns the dashboard");
+    expect(response.body.find("fetch('/health'") != std::string::npos,
+           "dashboard checks the implemented health route");
+
+    response = personal_cloud::route_request(
         {"GET", "/missing", "HTTP/1.1", {}, {}});
     expect(response.status_code == 404, "unknown GET path returns 404");
 
     response = personal_cloud::route_request(
         {"POST", "/hello", "HTTP/1.1", {}, {}});
     expect(response.status_code == 405, "unsupported method returns 405");
+    expect(response.headers.size() == 1 &&
+               response.headers.front() ==
+                   std::pair<std::string, std::string>{"Allow", "GET"},
+           "405 response identifies the allowed method");
 
     const personal_cloud::HttpRequest upload_request {
         "POST",
@@ -149,6 +275,12 @@ void test_routing() {
     response = personal_cloud::route_request(unsupported_upload);
     expect(response.status_code == 415,
            "POST /upload rejects an invalid text/plain prefix");
+
+    unsupported_upload.headers["content-type"] =
+        " Text/Plain \t; charset=utf-8";
+    response = personal_cloud::route_request(unsupported_upload);
+    expect(response.status_code == 200,
+           "POST /upload accepts case-insensitive media types and OWS");
 }
 
 void test_response_serialization() {
@@ -157,6 +289,7 @@ void test_response_serialization() {
         "OK",
         "text/plain; charset=utf-8",
         "abc",
+        {{"X-Test", "value"}},
     };
 
     const std::string serialized =
@@ -164,6 +297,7 @@ void test_response_serialization() {
     const std::string expected =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n"
+        "X-Test: value\r\n"
         "Content-Length: 3\r\n"
         "Connection: close\r\n"
         "\r\n"
@@ -178,6 +312,7 @@ void test_response_serialization() {
 int main() {
     test_valid_request();
     test_invalid_requests();
+    test_protocol_validation();
     test_request_body();
     test_routing();
     test_response_serialization();

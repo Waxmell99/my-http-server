@@ -317,8 +317,8 @@
     <div class="welcome">
         <h2>✅ 服务器运行正常</h2>
         <p>
-            静态文件服务已就绪 · 基于 C + pthread 并发模型 · 
-            当前根目录 <code>./www</code>
+            HTTP 服务已就绪 · 基于 C++20 + epoll ET 模型 ·
+            健康检查 <code>/health</code>
         </p>
     </div>
 
@@ -335,9 +335,9 @@
             <div class="sub">页面打开后计时</div>
         </div>
         <div class="info-card">
-            <div class="label">📁 文件服务</div>
-            <div class="value">静态资源</div>
-            <div class="sub">支持 HTML / CSS / JS / 图片</div>
+            <div class="label">🔌 HTTP 功能</div>
+            <div class="value">GET / POST</div>
+            <div class="sub">健康检查与文本上传</div>
         </div>
     </div>
 
@@ -350,7 +350,7 @@
 
     <!-- 页脚 -->
     <div class="footer">
-        <span>☁️ 个人云服务器 · C语言实现</span>
+        <span>☁️ 个人云服务器 · C++ 实现</span>
         <span>
             用 <a href="#" onclick="event.preventDefault();">❤️</a> 与 
             <a href="#" onclick="event.preventDefault();">Socket</a> 构建
@@ -406,8 +406,8 @@
             let latency = 0;
 
             try {
-                // 给服务器发一个 HEAD 请求（只拿响应头，不拿正文，开销最小）
-                const resp = await fetch('/', { method: 'HEAD', cache: 'no-store' });
+                // 使用服务器已经实现的健康检查路由。
+                const resp = await fetch('/health', { method: 'GET', cache: 'no-store' });
                 latency = Math.round(performance.now() - start);
                 ok = resp.ok;
             } catch (_) {

@@ -113,6 +113,24 @@ void handle_client(int client_fd) {
                     "Payload Too Large\n");
                 return;
 
+            case HttpParseResult::version_not_supported:
+                write_log(std::cerr, "HTTP version is not supported.\n");
+                send_error_response(
+                    client_fd,
+                    505,
+                    "HTTP Version Not Supported",
+                    "HTTP Version Not Supported\n");
+                return;
+
+            case HttpParseResult::expectation_failed:
+                write_log(std::cerr, "HTTP expectation is not supported.\n");
+                send_error_response(
+                    client_fd,
+                    417,
+                    "Expectation Failed",
+                    "Expectation Failed\n");
+                return;
+
             case HttpParseResult::complete:
                 break;
         }
