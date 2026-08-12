@@ -5,6 +5,9 @@ project(personal_cloud_server VERSION 0.1.0 LANGUAGES CXX)
 
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(Sodium REQUIRED IMPORTED_TARGET libsodium)
+find_package(nlohmann_json 3.11 REQUIRED)
 
 # 生成 compile_commands.json，方便 clangd 等工具理解项目。
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -14,12 +17,14 @@ add_executable(http_server
     src/main.cpp
     src/backend_application.cpp
     src/backend_config.cpp
+    src/auth_service.cpp
     src/database.cpp
     src/epoll_server.cpp
     src/http_server.cpp
     src/http_request.cpp
     src/http_response.cpp
     src/router.cpp
+    src/thread_pool.cpp
 )
 
 # 只对 http_server 目标启用 C++20。
@@ -30,7 +35,13 @@ target_include_directories(http_server
     PRIVATE
         "${PROJECT_SOURCE_DIR}/include"
 )
-target_link_libraries(http_server PRIVATE Threads::Threads SQLite::SQLite3)
+target_link_libraries(http_server
+    PRIVATE
+        Threads::Threads
+        SQLite::SQLite3
+        PkgConfig::Sodium
+        nlohmann_json::nlohmann_json
+)
 
 # GCC 和 Clang 使用的常见警告选项。
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -98,11 +109,15 @@ if(BUILD_TESTING)
 
     add_executable(server_integration_tests
         tests/server_integration_test.cpp
+        src/auth_service.cpp
+        src/backend_application.cpp
+        src/database.cpp
         src/epoll_server.cpp
         src/http_server.cpp
         src/http_request.cpp
         src/http_response.cpp
         src/router.cpp
+        src/thread_pool.cpp
     )
 
     target_compile_features(server_integration_tests PRIVATE cxx_std_20)
@@ -110,7 +125,13 @@ if(BUILD_TESTING)
         PRIVATE
             "${PROJECT_SOURCE_DIR}/include"
     )
-    target_link_libraries(server_integration_tests PRIVATE Threads::Threads)
+    target_link_libraries(server_integration_tests
+        PRIVATE
+            Threads::Threads
+            SQLite::SQLite3
+            PkgConfig::Sodium
+            nlohmann_json::nlohmann_json
+    )
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(server_integration_tests
@@ -126,6 +147,7 @@ if(BUILD_TESTING)
 
     add_executable(backend_tests
         tests/backend_test.cpp
+        src/auth_service.cpp
         src/backend_application.cpp
         src/backend_config.cpp
         src/database.cpp
@@ -138,7 +160,13 @@ if(BUILD_TESTING)
         PRIVATE
             "${PROJECT_SOURCE_DIR}/include"
     )
-    target_link_libraries(backend_tests PRIVATE SQLite::SQLite3 Threads::Threads)
+    target_link_libraries(backend_tests
+        PRIVATE
+            SQLite::SQLite3
+            Threads::Threads
+            PkgConfig::Sodium
+            nlohmann_json::nlohmann_json
+    )
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(backend_tests

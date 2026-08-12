@@ -1,6 +1,7 @@
 #include "server/epoll_server.h"
 
 #include "common/log.h"
+#include "concurrency/thread_pool.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "http/router.h"
@@ -10,9 +11,12 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <deque>
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <pthread.h>
 #include <signal.h>
 #include <string>
@@ -23,6 +27,7 @@
 
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -39,11 +44,16 @@ constexpr std::chrono::seconds timeout_check_interval{1};
 constexpr std::chrono::seconds accept_retry_interval{1};
 constexpr std::uint32_t listening_event_flags =
     EPOLLIN | EPOLLET | EPOLLONESHOT;
+constexpr std::uint64_t listening_event_id = 1;
+constexpr std::uint64_t signal_event_id = 2;
+constexpr std::uint64_t completion_event_id = 3;
+constexpr std::uint64_t first_connection_id = 4;
 
 using Clock = std::chrono::steady_clock;
 
 enum class ConnectionState {
     receiving,
+    processing,
     sending,
 };
 
@@ -54,11 +64,18 @@ enum class SignalReadResult {
 };
 
 struct ClientConnection {
+    std::uint64_t id{0};
     std::string request_buffer;
     std::string response_buffer;
     std::size_t sent_size{0};
     Clock::time_point last_activity{Clock::now()};
     ConnectionState state{ConnectionState::receiving};
+};
+
+struct TaskCompletion {
+    int client_fd{-1};
+    std::uint64_t connection_id{0};
+    HttpResponse response;
 };
 
 HttpResponse make_error_response(
@@ -79,6 +96,9 @@ public:
         : config_(std::move(config)), stop_token_(stop_token) {}
 
     ~EpollEventLoop() {
+        // worker 可能仍会写完成队列/eventfd，必须先等待它们退出。
+        worker_pool_.reset();
+
         for (const auto& [client_fd, connection] : clients_) {
             static_cast<void>(connection);
             close_socket(client_fd);
@@ -87,6 +107,7 @@ public:
         close_socket(listening_fd_);
         close_socket(epoll_fd_);
         close_socket(signal_fd_);
+        close_socket(completion_fd_);
         close_socket(reserve_fd_);
 
         if (signal_mask_changed_) {
@@ -125,16 +146,16 @@ public:
 
             for (int index = 0; index < ready_count; ++index) {
                 const epoll_event event = events_[index];
-                const int socket_fd = event.data.fd;
+                const std::uint64_t event_id = event.data.u64;
 
-                if (socket_fd == listening_fd_) {
+                if (event_id == listening_event_id) {
                     if (!accept_ready_clients()) {
                         return 1;
                     }
                     continue;
                 }
 
-                if (socket_fd == signal_fd_) {
+                if (event_id == signal_event_id) {
                     if ((event.events & (EPOLLERR | EPOLLHUP)) != 0U) {
                         write_log(
                             std::cerr,
@@ -155,7 +176,24 @@ public:
                     continue;
                 }
 
-                handle_client_event(socket_fd, event.events);
+                if (event_id == completion_event_id) {
+                    if ((event.events & (EPOLLERR | EPOLLHUP)) != 0U) {
+                        write_log(
+                            std::cerr,
+                            "Application completion descriptor failed.\n");
+                        return 1;
+                    }
+                    if ((event.events & EPOLLIN) != 0U &&
+                        !consume_task_completions()) {
+                        return 1;
+                    }
+                    continue;
+                }
+
+                const auto client = connection_fds_.find(event_id);
+                if (client != connection_fds_.end()) {
+                    handle_client_event(client->second, event.events);
+                }
             }
 
             remove_idle_clients();
@@ -171,7 +209,10 @@ private:
             config_.maximum_connections == 0 ||
             config_.maximum_events >
                 static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
-            config_.idle_timeout <= std::chrono::seconds::zero()) {
+            config_.idle_timeout <= std::chrono::seconds::zero() ||
+            (config_.request_task_factory &&
+             (config_.application_worker_count == 0 ||
+              config_.application_queue_size == 0))) {
             write_log(std::cerr, "Invalid epoll server configuration.\n");
             return false;
         }
@@ -200,7 +241,7 @@ private:
 
         epoll_event listening_event {};
         listening_event.events = listening_event_flags;
-        listening_event.data.fd = listening_fd_;
+        listening_event.data.u64 = listening_event_id;
         if (::epoll_ctl(
                 epoll_fd_,
                 EPOLL_CTL_ADD,
@@ -213,13 +254,46 @@ private:
         if (signal_fd_ >= 0) {
             epoll_event signal_event {};
             signal_event.events = EPOLLIN;
-            signal_event.data.fd = signal_fd_;
+            signal_event.data.u64 = signal_event_id;
             if (::epoll_ctl(
                     epoll_fd_,
                     EPOLL_CTL_ADD,
                     signal_fd_,
                     &signal_event) == -1) {
                 std::perror("epoll_ctl add termination signal descriptor");
+                return false;
+            }
+        }
+
+        if (config_.request_task_factory) {
+            completion_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+            if (completion_fd_ == -1) {
+                std::perror("eventfd");
+                return false;
+            }
+
+            epoll_event completion_event {};
+            completion_event.events = EPOLLIN;
+            completion_event.data.u64 = completion_event_id;
+            if (::epoll_ctl(
+                    epoll_fd_,
+                    EPOLL_CTL_ADD,
+                    completion_fd_,
+                    &completion_event) == -1) {
+                std::perror("epoll_ctl add application completion descriptor");
+                return false;
+            }
+
+            try {
+                worker_pool_ = std::make_unique<ThreadPool>(
+                    config_.application_worker_count,
+                    config_.application_queue_size);
+            } catch (const std::exception& error) {
+                write_log(
+                    std::cerr,
+                    "Cannot create application worker pool: ",
+                    error.what(),
+                    '\n');
                 return false;
             }
         }
@@ -333,7 +407,12 @@ private:
                 continue;
             }
 
-            auto [connection, inserted] = clients_.try_emplace(client_fd);
+            const std::uint64_t connection_id = allocate_connection_id();
+            ClientConnection new_connection;
+            new_connection.id = connection_id;
+            auto [connection, inserted] = clients_.try_emplace(
+                client_fd,
+                std::move(new_connection));
             if (!inserted) {
                 close_socket(client_fd);
                 continue;
@@ -341,7 +420,7 @@ private:
 
             epoll_event client_event {};
             client_event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
-            client_event.data.fd = client_fd;
+            client_event.data.u64 = connection_id;
             if (::epoll_ctl(
                     epoll_fd_,
                     EPOLL_CTL_ADD,
@@ -352,6 +431,7 @@ private:
                 close_socket(client_fd);
                 continue;
             }
+            connection_fds_.emplace(connection_id, client_fd);
 
             if (config_.verbose_logging) {
                 write_log(
@@ -363,7 +443,7 @@ private:
     bool rearm_listening_socket() {
         epoll_event listening_event {};
         listening_event.events = listening_event_flags;
-        listening_event.data.fd = listening_fd_;
+        listening_event.data.u64 = listening_event_id;
         if (::epoll_ctl(
                 epoll_fd_,
                 EPOLL_CTL_MOD,
@@ -539,16 +619,18 @@ private:
                 }
 
                 if (config_.verbose_logging) {
+                    const std::string_view logged_path(request.path);
                     write_log(
                         std::cout,
                         "Parsed request, fd = ", client_fd,
                         ", method = ", request.method,
-                        ", path = ", request.path,
+                        ", path = ", logged_path.substr(
+                            0, logged_path.find('?')),
                         ", body = ", request.body.size(),
                         " bytes\n");
                 }
-                return queue_response(
-                    client_fd, connection, dispatch_request(request));
+                return begin_request_processing(
+                    client_fd, connection, request);
             }
 
             if (received == 0) {
@@ -638,6 +720,182 @@ private:
             "Internal Server Error\n");
     }
 
+    bool begin_request_processing(
+        int client_fd,
+        ClientConnection& connection,
+        const HttpRequest& request) {
+        if (!config_.request_task_factory) {
+            return queue_response(
+                client_fd, connection, dispatch_request(request));
+        }
+
+        std::optional<ApplicationTask> task;
+        try {
+            task = config_.request_task_factory(request);
+        } catch (const std::exception& error) {
+            write_log(
+                std::cerr,
+                "Application task factory failed: ",
+                error.what(),
+                '\n');
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    500,
+                    "Internal Server Error",
+                    "Internal Server Error\n"));
+        } catch (...) {
+            write_log(
+                std::cerr,
+                "Application task factory failed with an unknown exception.\n");
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    500,
+                    "Internal Server Error",
+                    "Internal Server Error\n"));
+        }
+
+        if (!task.has_value()) {
+            return queue_response(
+                client_fd, connection, dispatch_request(request));
+        }
+
+        const std::uint64_t connection_id = connection.id;
+        const bool submitted = worker_pool_ != nullptr &&
+            worker_pool_->submit(
+                [this,
+                 client_fd,
+                 connection_id,
+                 application_task = std::move(*task)]() mutable {
+                    HttpResponse response = make_error_response(
+                        500,
+                        "Internal Server Error",
+                        "Internal Server Error\n");
+                    try {
+                        response = application_task();
+                    } catch (const std::exception& error) {
+                        write_log(
+                            std::cerr,
+                            "Application task failed: ",
+                            error.what(),
+                            '\n');
+                        response = make_error_response(
+                            500,
+                            "Internal Server Error",
+                            "Internal Server Error\n");
+                    } catch (...) {
+                        write_log(
+                            std::cerr,
+                            "Application task failed with an unknown "
+                            "exception.\n");
+                        response = make_error_response(
+                            500,
+                            "Internal Server Error",
+                            "Internal Server Error\n");
+                    }
+                    post_task_completion(
+                        {client_fd, connection_id, std::move(response)});
+                });
+
+        if (!submitted) {
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    503,
+                    "Service Unavailable",
+                    "Application task queue is full\n"));
+        }
+
+        connection.state = ConnectionState::processing;
+        connection.last_activity = Clock::now();
+        connection.request_buffer.clear();
+
+        // 请求处理期间不再读取更多数据；RDHUP/HUP 仍用于观察客户端生命周期。
+        epoll_event client_event {};
+        client_event.events = EPOLLRDHUP | EPOLLET;
+        client_event.data.u64 = connection.id;
+        if (::epoll_ctl(
+                epoll_fd_,
+                EPOLL_CTL_MOD,
+                client_fd,
+                &client_event) == -1) {
+            std::perror("epoll_ctl pause client Socket for application task");
+            return false;
+        }
+        return true;
+    }
+
+    void post_task_completion(TaskCompletion completion) {
+        {
+            std::lock_guard lock(completions_mutex_);
+            completions_.push_back(std::move(completion));
+        }
+
+        const std::uint64_t increment = 1;
+        while (::write(completion_fd_, &increment, sizeof(increment)) == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                std::perror("write application completion eventfd");
+            }
+            break;
+        }
+    }
+
+    bool consume_task_completions() {
+        std::uint64_t completed_count = 0;
+        while (true) {
+            const ssize_t received = ::read(
+                completion_fd_, &completed_count, sizeof(completed_count));
+            if (received == static_cast<ssize_t>(sizeof(completed_count))) {
+                continue;
+            }
+            if (received == -1 && errno == EINTR) {
+                continue;
+            }
+            if (received == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+            if (received == -1) {
+                std::perror("read application completion eventfd");
+            } else {
+                write_log(
+                    std::cerr,
+                    "Short read from application completion eventfd.\n");
+            }
+            return false;
+        }
+
+        std::deque<TaskCompletion> ready;
+        {
+            std::lock_guard lock(completions_mutex_);
+            ready.swap(completions_);
+        }
+
+        for (TaskCompletion& completion : ready) {
+            const auto found = clients_.find(completion.client_fd);
+            if (found == clients_.end() ||
+                found->second.id != completion.connection_id ||
+                found->second.state != ConnectionState::processing) {
+                continue;
+            }
+
+            if (!queue_response(
+                    completion.client_fd,
+                    found->second,
+                    completion.response)) {
+                close_client(completion.client_fd);
+            }
+        }
+        return true;
+    }
+
     bool queue_response(
         int client_fd,
         ClientConnection& connection,
@@ -652,7 +910,7 @@ private:
 
         epoll_event client_event {};
         client_event.events = EPOLLOUT | EPOLLRDHUP | EPOLLET;
-        client_event.data.fd = client_fd;
+        client_event.data.u64 = connection.id;
         if (::epoll_ctl(
                 epoll_fd_,
                 EPOLL_CTL_MOD,
@@ -683,6 +941,7 @@ private:
         next_timeout_check_ = now + timeout_check_interval;
 
         std::vector<int> receiving_timeouts;
+        std::vector<int> processing_timeouts;
         std::vector<int> sending_timeouts;
 
         for (const auto& [client_fd, connection] : clients_) {
@@ -692,9 +951,20 @@ private:
 
             if (connection.state == ConnectionState::receiving) {
                 receiving_timeouts.push_back(client_fd);
+            } else if (connection.state == ConnectionState::processing) {
+                processing_timeouts.push_back(client_fd);
             } else {
                 sending_timeouts.push_back(client_fd);
             }
+        }
+
+        for (int client_fd : processing_timeouts) {
+            write_log(
+                std::cerr,
+                "Client application task timeout, fd = ",
+                client_fd,
+                '\n');
+            close_client(client_fd);
         }
 
         for (int client_fd : receiving_timeouts) {
@@ -730,6 +1000,10 @@ private:
     }
 
     void close_client(int client_fd) {
+        const auto found = clients_.find(client_fd);
+        if (found != clients_.end()) {
+            connection_fds_.erase(found->second.id);
+        }
         static_cast<void>(::epoll_ctl(
             epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr));
         clients_.erase(client_fd);
@@ -737,17 +1011,32 @@ private:
         resume_paused_accepts();
     }
 
+    std::uint64_t allocate_connection_id() {
+        const std::uint64_t result = next_connection_id_;
+        ++next_connection_id_;
+        if (next_connection_id_ < first_connection_id) {
+            next_connection_id_ = first_connection_id;
+        }
+        return result;
+    }
+
     EpollServerConfig config_;
     std::stop_token stop_token_;
     int listening_fd_{-1};
     int epoll_fd_{-1};
     int signal_fd_{-1};
+    int completion_fd_{-1};
     int reserve_fd_{-1};
     sigset_t previous_signal_mask_ {};
     bool signal_mask_changed_{false};
     bool accepting_paused_{false};
     std::vector<epoll_event> events_;
     std::unordered_map<int, ClientConnection> clients_;
+    std::unordered_map<std::uint64_t, int> connection_fds_;
+    std::uint64_t next_connection_id_{first_connection_id};
+    std::unique_ptr<ThreadPool> worker_pool_;
+    std::mutex completions_mutex_;
+    std::deque<TaskCompletion> completions_;
     Clock::time_point next_timeout_check_{Clock::now()};
     Clock::time_point next_accept_retry_{Clock::now()};
 };

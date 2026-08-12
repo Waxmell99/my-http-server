@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 
 #include <filesystem>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 
@@ -10,6 +11,8 @@ namespace personal_cloud {
 namespace {
 
 constexpr int latest_schema_version = 1;
+
+std::runtime_error sqlite_error(sqlite3* connection, const char* operation);
 
 class Statement final {
 public:
@@ -36,6 +39,37 @@ public:
         return statement_;
     }
 
+    void bind_text(int index, std::string_view value) {
+        if (::sqlite3_bind_text(
+                statement_,
+                index,
+                value.data(),
+                static_cast<int>(value.size()),
+                SQLITE_TRANSIENT) != SQLITE_OK) {
+            throw sqlite_error(
+                ::sqlite3_db_handle(statement_), "Cannot bind SQLite text");
+        }
+    }
+
+    void bind_int64(int index, std::int64_t value) {
+        if (::sqlite3_bind_int64(statement_, index, value) != SQLITE_OK) {
+            throw sqlite_error(
+                ::sqlite3_db_handle(statement_), "Cannot bind SQLite integer");
+        }
+    }
+
+    void bind_blob(int index, const SessionTokenHash& value) {
+        if (::sqlite3_bind_blob(
+                statement_,
+                index,
+                value.data(),
+                static_cast<int>(value.size()),
+                SQLITE_TRANSIENT) != SQLITE_OK) {
+            throw sqlite_error(
+                ::sqlite3_db_handle(statement_), "Cannot bind SQLite blob");
+        }
+    }
+
 private:
     sqlite3_stmt* statement_{nullptr};
 };
@@ -47,12 +81,19 @@ std::runtime_error sqlite_error(sqlite3* connection, const char* operation) {
 
 }  // namespace
 
-Database::Database(const std::filesystem::path& path) {
+Database::Database(
+    const std::filesystem::path& path,
+    DatabaseOpenMode mode) {
     const std::string path_text = path.string();
+    int open_flags =
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI;
+    if (mode == DatabaseOpenMode::initialize_schema) {
+        open_flags |= SQLITE_OPEN_CREATE;
+    }
     const int result = ::sqlite3_open_v2(
         path_text.c_str(),
         &connection_,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+        open_flags,
         nullptr);
     if (result != SQLITE_OK) {
         const std::string message = connection_ != nullptr
@@ -73,10 +114,12 @@ Database::Database(const std::filesystem::path& path) {
         }
 
         execute("PRAGMA foreign_keys = ON;");
-        execute("PRAGMA journal_mode = WAL;");
         execute("PRAGMA synchronous = NORMAL;");
-        apply_migrations();
-        verify_schema();
+        if (mode == DatabaseOpenMode::initialize_schema) {
+            execute("PRAGMA journal_mode = WAL;");
+            apply_migrations();
+            verify_schema();
+        }
     } catch (...) {
         ::sqlite3_close(connection_);
         connection_ = nullptr;
@@ -111,6 +154,139 @@ bool Database::health_check() const noexcept {
                          ::sqlite3_column_int(statement, 0) == 1;
     ::sqlite3_finalize(statement);
     return healthy;
+}
+
+std::optional<std::int64_t> Database::create_user(
+    std::string_view username,
+    std::string_view password_hash,
+    std::int64_t created_at) {
+    Statement statement(
+        connection_,
+        "INSERT INTO users(username, password_hash, created_at) "
+        "VALUES(?1, ?2, ?3);");
+    statement.bind_text(1, username);
+    statement.bind_text(2, password_hash);
+    statement.bind_int64(3, created_at);
+
+    const int result = ::sqlite3_step(statement.get());
+    if (result == SQLITE_DONE) {
+        return ::sqlite3_last_insert_rowid(connection_);
+    }
+
+    const int extended_error = ::sqlite3_extended_errcode(connection_);
+    if (extended_error == SQLITE_CONSTRAINT_UNIQUE ||
+        extended_error == SQLITE_CONSTRAINT_PRIMARYKEY) {
+        return std::nullopt;
+    }
+    throw sqlite_error(connection_, "Cannot create user");
+}
+
+std::optional<StoredUser> Database::find_user_by_username(
+    std::string_view username) const {
+    Statement statement(
+        connection_,
+        "SELECT id, username, password_hash, created_at "
+        "FROM users WHERE username = ?1;");
+    statement.bind_text(1, username);
+
+    const int result = ::sqlite3_step(statement.get());
+    if (result == SQLITE_DONE) {
+        return std::nullopt;
+    }
+    if (result != SQLITE_ROW) {
+        throw sqlite_error(connection_, "Cannot find user");
+    }
+
+    const auto* username_text = reinterpret_cast<const char*>(
+        ::sqlite3_column_text(statement.get(), 1));
+    const auto* password_hash_text = reinterpret_cast<const char*>(
+        ::sqlite3_column_text(statement.get(), 2));
+    if (username_text == nullptr || password_hash_text == nullptr) {
+        throw std::runtime_error("Stored user contains invalid null fields");
+    }
+
+    return StoredUser{
+        ::sqlite3_column_int64(statement.get(), 0),
+        username_text,
+        password_hash_text,
+        ::sqlite3_column_int64(statement.get(), 3),
+    };
+}
+
+bool Database::create_session(
+    const SessionTokenHash& token_hash,
+    std::int64_t user_id,
+    std::int64_t expires_at,
+    std::int64_t created_at) {
+    Statement statement(
+        connection_,
+        "INSERT INTO sessions(token_hash, user_id, expires_at, created_at) "
+        "VALUES(?1, ?2, ?3, ?4);");
+    statement.bind_blob(1, token_hash);
+    statement.bind_int64(2, user_id);
+    statement.bind_int64(3, expires_at);
+    statement.bind_int64(4, created_at);
+
+    const int result = ::sqlite3_step(statement.get());
+    if (result == SQLITE_DONE) {
+        return true;
+    }
+    const int extended_error = ::sqlite3_extended_errcode(connection_);
+    if (extended_error == SQLITE_CONSTRAINT_UNIQUE ||
+        extended_error == SQLITE_CONSTRAINT_PRIMARYKEY) {
+        return false;
+    }
+    throw sqlite_error(connection_, "Cannot create session");
+}
+
+std::optional<SessionUser> Database::find_session_user(
+    const SessionTokenHash& token_hash,
+    std::int64_t now) const {
+    Statement statement(
+        connection_,
+        "SELECT users.id, users.username, users.created_at "
+        "FROM sessions JOIN users ON users.id = sessions.user_id "
+        "WHERE sessions.token_hash = ?1 AND sessions.expires_at > ?2;");
+    statement.bind_blob(1, token_hash);
+    statement.bind_int64(2, now);
+
+    const int result = ::sqlite3_step(statement.get());
+    if (result == SQLITE_DONE) {
+        return std::nullopt;
+    }
+    if (result != SQLITE_ROW) {
+        throw sqlite_error(connection_, "Cannot find session");
+    }
+
+    const auto* username_text = reinterpret_cast<const char*>(
+        ::sqlite3_column_text(statement.get(), 1));
+    if (username_text == nullptr) {
+        throw std::runtime_error("Stored session user has a null username");
+    }
+    return SessionUser{
+        ::sqlite3_column_int64(statement.get(), 0),
+        username_text,
+        ::sqlite3_column_int64(statement.get(), 2),
+    };
+}
+
+bool Database::delete_session(const SessionTokenHash& token_hash) {
+    Statement statement(
+        connection_, "DELETE FROM sessions WHERE token_hash = ?1;");
+    statement.bind_blob(1, token_hash);
+    if (::sqlite3_step(statement.get()) != SQLITE_DONE) {
+        throw sqlite_error(connection_, "Cannot delete session");
+    }
+    return ::sqlite3_changes(connection_) != 0;
+}
+
+void Database::delete_expired_sessions(std::int64_t now) {
+    Statement statement(
+        connection_, "DELETE FROM sessions WHERE expires_at <= ?1;");
+    statement.bind_int64(1, now);
+    if (::sqlite3_step(statement.get()) != SQLITE_DONE) {
+        throw sqlite_error(connection_, "Cannot delete expired sessions");
+    }
 }
 
 void Database::execute(const char* sql) {

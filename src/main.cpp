@@ -36,6 +36,11 @@ int main(int argc, char* argv[]) {
                                                 request) {
             return application.handle_request(request);
         };
+        config.server.request_task_factory = [&application](
+                                                 const personal_cloud::HttpRequest&
+                                                     request) {
+            return application.make_task(request);
+        };
 
         return personal_cloud::run_epoll_server(config.server);
     } catch (const std::exception& error) {

@@ -7,11 +7,14 @@
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -116,6 +119,29 @@ public:
         return value;
     }
 
+    [[nodiscard]] std::string scalar_text(const char* sql) {
+        sqlite3_stmt* statement = nullptr;
+        if (::sqlite3_prepare_v2(
+                connection_, sql, -1, &statement, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("Cannot prepare test text query");
+        }
+
+        const int step_result = ::sqlite3_step(statement);
+        std::string value;
+        if (step_result == SQLITE_ROW) {
+            const auto* text = reinterpret_cast<const char*>(
+                ::sqlite3_column_text(statement, 0));
+            if (text != nullptr) {
+                value = text;
+            }
+        }
+        ::sqlite3_finalize(statement);
+        if (step_result != SQLITE_ROW) {
+            throw std::runtime_error("Test text query returned no row");
+        }
+        return value;
+    }
+
 private:
     sqlite3* connection_{nullptr};
 };
@@ -124,6 +150,49 @@ personal_cloud::ConfigParseResult parse(
     std::initializer_list<std::string_view> arguments) {
     const std::vector<std::string_view> values(arguments);
     return personal_cloud::parse_backend_config(values);
+}
+
+personal_cloud::HttpResponse run_application_task(
+    personal_cloud::BackendApplication& application,
+    personal_cloud::HttpRequest request) {
+    std::optional<personal_cloud::ApplicationTask> task =
+        application.make_task(request);
+    if (!task.has_value()) {
+        throw std::runtime_error("Expected an asynchronous application task");
+    }
+    return (*task)();
+}
+
+personal_cloud::HttpRequest json_request(
+    std::string path,
+    std::string body) {
+    return {
+        "POST",
+        std::move(path),
+        "HTTP/1.1",
+        {{"content-type", "application/json"}},
+        std::move(body),
+    };
+}
+
+std::optional<std::string> response_header(
+    const personal_cloud::HttpResponse& response,
+    std::string_view name) {
+    for (const auto& [header_name, value] : response.headers) {
+        if (header_name == name) {
+            return value;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string cookie_pair(const personal_cloud::HttpResponse& response) {
+    const std::optional<std::string> set_cookie =
+        response_header(response, "Set-Cookie");
+    if (!set_cookie.has_value()) {
+        return {};
+    }
+    return set_cookie->substr(0, set_cookie->find(';'));
 }
 
 void test_configuration() {
@@ -149,6 +218,10 @@ void test_configuration() {
         "321",
         "--idle-timeout",
         "17",
+        "--worker-count",
+        "7",
+        "--task-queue-size",
+        "99",
         "--verbose",
     });
     expect(result.config.has_value(), "parse all supported backend options");
@@ -159,6 +232,10 @@ void test_configuration() {
                "parse the configured connection limit");
         expect(result.config->server.idle_timeout.count() == 17,
                "parse the configured idle timeout");
+        expect(result.config->server.application_worker_count == 7,
+               "parse the configured application worker count");
+        expect(result.config->server.application_queue_size == 99,
+               "parse the configured application task queue size");
         expect(result.config->server.verbose_logging,
                "parse verbose logging flag");
     }
@@ -171,6 +248,10 @@ void test_configuration() {
            "reject a negative idle timeout");
     expect(!parse({"--database"}).config.has_value(),
            "reject a missing option value");
+    expect(!parse({"--worker-count", "0"}).config.has_value(),
+           "reject a zero application worker count");
+    expect(!parse({"--task-queue-size", "-1"}).config.has_value(),
+           "reject a negative application task queue size");
     expect(!parse({"--unknown"}).config.has_value(),
            "reject an unknown option");
     expect(parse({"--help"}).show_help, "recognize the help option");
@@ -203,6 +284,21 @@ void test_database_migrations_and_persistence() {
                    "{\"status\":\"ok\",\"database\":\"ok\","
                    "\"schema_version\":1}\n",
                "report the database schema version as JSON");
+
+        std::optional<personal_cloud::ApplicationTask> status_task =
+            application.make_task(
+                {"GET", "/api/status", "HTTP/1.1", {}, {}});
+        expect(status_task.has_value() &&
+                   (*status_task)().status_code == 200,
+               "create an asynchronous task for a backend status request");
+        expect(!application.make_task(
+                    {"GET", "/health", "HTTP/1.1", {}, {}})
+                    .has_value(),
+               "keep fast built-in routes on the epoll thread");
+        expect(application.make_task(
+                   {"GET", "/", "HTTP/1.1", {}, {}})
+                   .has_value(),
+               "move static page file reads to an application worker");
 
         const personal_cloud::HttpResponse wrong_method =
             application.handle_request(
@@ -293,6 +389,279 @@ void test_rejects_incomplete_schema() {
     expect(rejected, "reject an incomplete database at a recorded version");
 }
 
+void test_authentication_lifecycle_and_security() {
+    TemporaryDirectory temporary;
+    const std::filesystem::path database_path = temporary.path() / "auth.db";
+
+    personal_cloud::BackendConfig config;
+    config.database_path = database_path;
+    config.storage_root = temporary.path() / "files";
+
+    std::string persisted_cookie;
+    std::string first_session_cookie;
+    {
+        personal_cloud::BackendApplication application(config);
+
+        personal_cloud::HttpResponse response = run_application_task(
+            application,
+            {"POST",
+             "/api/auth/register",
+             "HTTP/1.1",
+             {},
+             "{\"username\":\"Alice\",\"password\":\"secret-pass\"}"});
+        expect(response.status_code == 415,
+               "require JSON content type for registration");
+
+        response = run_application_task(
+            application,
+            json_request("/api/auth/register", "not-json"));
+        expect(response.status_code == 400,
+               "reject malformed authentication JSON");
+
+        response = run_application_task(
+            application,
+            json_request(
+                "/api/auth/register",
+                "{\"username\":\"bad space\",\"password\":\"short\"}"));
+        expect(response.status_code == 422,
+               "validate username and password format");
+
+        response = run_application_task(
+            application,
+            json_request(
+                "/api/auth/register",
+                "{\"username\":\"Alice\","
+                "\"password\":\"correct-horse-battery\"}"));
+        expect(response.status_code == 201 &&
+                   response.body.find("\"username\":\"Alice\"") !=
+                       std::string::npos,
+               "register a user through the asynchronous auth task");
+
+        response = run_application_task(
+            application,
+            json_request(
+                "/api/auth/register",
+                "{\"username\":\"alice\","
+                "\"password\":\"another-password\"}"));
+        expect(response.status_code == 409,
+               "enforce case-insensitive username uniqueness");
+
+        const personal_cloud::HttpResponse missing_user =
+            run_application_task(
+                application,
+                json_request(
+                    "/api/auth/login",
+                    "{\"username\":\"Nobody\","
+                    "\"password\":\"wrong-password\"}"));
+        const personal_cloud::HttpResponse wrong_password =
+            run_application_task(
+                application,
+                json_request(
+                    "/api/auth/login",
+                    "{\"username\":\"Alice\","
+                    "\"password\":\"wrong-password\"}"));
+        expect(missing_user.status_code == 401 &&
+                   wrong_password.status_code == 401 &&
+                   missing_user.body == wrong_password.body,
+               "return the same login error for missing users and bad passwords");
+
+        response = run_application_task(
+            application,
+            json_request(
+                "/api/auth/login",
+                "{\"username\":\"aLiCe\","
+                "\"password\":\"correct-horse-battery\"}"));
+        const std::optional<std::string> set_cookie =
+            response_header(response, "Set-Cookie");
+        persisted_cookie = cookie_pair(response);
+        first_session_cookie = persisted_cookie;
+        expect(response.status_code == 200 && !persisted_cookie.empty(),
+               "log in with case-insensitive username lookup");
+        expect(set_cookie.has_value() &&
+                   set_cookie->find("HttpOnly") != std::string::npos &&
+                   set_cookie->find("SameSite=Strict") != std::string::npos &&
+                   set_cookie->find("Path=/") != std::string::npos,
+               "set hardened session cookie attributes");
+        expect(response.body.find("pc_session") == std::string::npos &&
+                   response.body.find(persisted_cookie) == std::string::npos,
+               "keep the plaintext session token out of the response body");
+
+        response = run_application_task(
+            application,
+            {"GET",
+             "/api/auth/me",
+             "HTTP/1.1",
+             {{"cookie", persisted_cookie}},
+             {}});
+        expect(response.status_code == 200 &&
+                   response.body.find("\"username\":\"Alice\"") !=
+                       std::string::npos,
+               "resolve the current user from a valid session cookie");
+
+        response = run_application_task(
+            application,
+            {"POST",
+             "/api/auth/logout",
+             "HTTP/1.1",
+             {{"cookie", persisted_cookie}},
+             {}});
+        const std::optional<std::string> cleared_cookie =
+            response_header(response, "Set-Cookie");
+        expect(response.status_code == 200 && cleared_cookie.has_value() &&
+                   cleared_cookie->find("Max-Age=0") != std::string::npos,
+               "logout deletes the session and clears the cookie");
+
+        response = run_application_task(
+            application,
+            {"GET",
+             "/api/auth/me",
+             "HTTP/1.1",
+             {{"cookie", persisted_cookie}},
+             {}});
+        expect(response.status_code == 401,
+               "reject a session after logout");
+
+        {
+            RawDatabase raw(database_path);
+            expect(raw.scalar_int("SELECT COUNT(*) FROM sessions;") == 0,
+                   "physically remove a logged-out session");
+        }
+
+        response = run_application_task(
+            application,
+            json_request(
+                "/api/auth/login",
+                "{\"username\":\"Alice\","
+                "\"password\":\"correct-horse-battery\"}"));
+        persisted_cookie = cookie_pair(response);
+        expect(response.status_code == 200 && !persisted_cookie.empty() &&
+                   persisted_cookie != first_session_cookie,
+               "issue a fresh random session that survives application restart");
+
+        response = run_application_task(
+            application,
+            {"POST", "/api/auth/me", "HTTP/1.1", {}, {}});
+        expect(response.status_code == 405 &&
+                   response_header(response, "Allow") ==
+                       std::optional<std::string>{"GET"},
+               "return Allow for an unsupported auth endpoint method");
+    }
+
+    {
+        RawDatabase raw(database_path);
+        expect(raw.scalar_text(
+                   "SELECT password_hash FROM users WHERE username='Alice';")
+                   .starts_with("$argon2id$"),
+               "store passwords as libsodium Argon2id hashes");
+        expect(raw.scalar_int(
+                   "SELECT instr(password_hash, 'correct-horse-battery') "
+                   "FROM users WHERE username='Alice';") == 0,
+               "never store the plaintext password");
+        expect(raw.scalar_int("SELECT COUNT(*) FROM sessions;") == 1,
+               "persist only the newly issued active session");
+    }
+
+    {
+        personal_cloud::BackendApplication reopened(config);
+        personal_cloud::HttpResponse response = run_application_task(
+            reopened,
+            {"GET",
+             "/api/auth/me",
+             "HTTP/1.1",
+             {{"cookie", persisted_cookie}},
+             {}});
+        expect(response.status_code == 200,
+               "preserve a valid session across application restart");
+
+        response = run_application_task(
+            reopened,
+            json_request(
+                "/api/auth/login",
+                "{\"username\":\"Alice\","
+                "\"password\":\"correct-horse-battery\"}"));
+        persisted_cookie = cookie_pair(response);
+        expect(response.status_code == 200 && !persisted_cookie.empty(),
+               "log in after restarting the application");
+
+        {
+            RawDatabase raw(database_path);
+            expect(raw.scalar_text(
+                       "SELECT typeof(token_hash) || ':' || "
+                       "length(token_hash) FROM sessions LIMIT 1;") ==
+                       "blob:32",
+                   "store only a fixed-size binary session token hash");
+            raw.execute("UPDATE sessions SET expires_at=0;");
+        }
+
+        response = run_application_task(
+            reopened,
+            {"GET",
+             "/api/auth/me",
+             "HTTP/1.1",
+             {{"cookie", persisted_cookie}},
+             {}});
+        expect(response.status_code == 401,
+               "reject an expired session");
+
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            response = run_application_task(
+                reopened,
+                json_request(
+                    "/api/auth/login",
+                    "{\"username\":\"RateLimited\","
+                    "\"password\":\"wrong-password\"}"));
+        }
+        personal_cloud::HttpRequest limited_request = json_request(
+            "/api/auth/login",
+            "{\"username\":\"ratelimited\","
+            "\"password\":\"wrong-password\"}");
+        auto first_attempt = std::async(
+            std::launch::async,
+            [&reopened, limited_request] {
+                return run_application_task(reopened, limited_request);
+            });
+        auto second_attempt = std::async(
+            std::launch::async,
+            [&reopened, limited_request] {
+                return run_application_task(reopened, limited_request);
+            });
+        const personal_cloud::HttpResponse first_response =
+            first_attempt.get();
+        const personal_cloud::HttpResponse second_response =
+            second_attempt.get();
+        const bool one_rate_limited =
+            (first_response.status_code == 401 &&
+             second_response.status_code == 429) ||
+            (first_response.status_code == 429 &&
+             second_response.status_code == 401);
+        const personal_cloud::HttpResponse& limited_response =
+            first_response.status_code == 429
+                ? first_response
+                : second_response;
+        expect(one_rate_limited &&
+                   response_header(limited_response, "Retry-After")
+                       .has_value(),
+               "count concurrent login attempts in the failure limit");
+    }
+}
+
+void test_authentication_with_shared_memory_database() {
+    TemporaryDirectory temporary;
+    personal_cloud::BackendConfig config;
+    config.database_path = ":memory:";
+    config.storage_root = temporary.path() / "files";
+
+    personal_cloud::BackendApplication application(config);
+    personal_cloud::HttpResponse response = run_application_task(
+        application,
+        json_request(
+            "/api/auth/register",
+            "{\"username\":\"MemoryUser\","
+            "\"password\":\"memory-password\"}"));
+    expect(response.status_code == 201,
+           "share an in-memory database with worker connections");
+}
+
 }  // namespace
 
 int main() {
@@ -301,6 +670,8 @@ int main() {
         test_database_migrations_and_persistence();
         test_rejects_newer_schema();
         test_rejects_incomplete_schema();
+        test_authentication_lifecycle_and_security();
+        test_authentication_with_shared_memory_database();
     } catch (const std::exception& error) {
         std::cerr << "Unexpected backend test exception: "
                   << error.what() << '\n';

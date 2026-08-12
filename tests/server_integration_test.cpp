@@ -1,3 +1,4 @@
+#include "app/backend_application.h"
 #include "server/epoll_server.h"
 
 #include "http/router.h"
@@ -11,8 +12,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -244,7 +248,11 @@ public:
         bool handle_termination_signals = true,
         std::size_t maximum_connections = 128,
         std::function<personal_cloud::HttpResponse(
-            const personal_cloud::HttpRequest&)> request_handler = {})
+            const personal_cloud::HttpRequest&)> request_handler = {},
+        personal_cloud::ApplicationTaskFactory request_task_factory = {},
+        std::size_t worker_count = 4,
+        std::size_t task_queue_size = 256,
+        std::chrono::seconds idle_timeout = 1s)
         : port_(find_available_port()) {
         if (port_ == 0) {
             return;
@@ -254,9 +262,12 @@ public:
         config.port = port_;
         config.maximum_events = 128;
         config.maximum_connections = maximum_connections;
-        config.idle_timeout = 1s;
+        config.idle_timeout = idle_timeout;
         config.handle_termination_signals = handle_termination_signals;
         config.request_handler = std::move(request_handler);
+        config.request_task_factory = std::move(request_task_factory);
+        config.application_worker_count = worker_count;
+        config.application_queue_size = task_queue_size;
         thread_ = std::jthread([this, config](std::stop_token token) {
             result_.store(
                 personal_cloud::run_epoll_server(config, token),
@@ -579,6 +590,362 @@ void test_application_handler_injection() {
            "stop normally after application handler requests");
 }
 
+bool wait_until_true(
+    const std::atomic<bool>& value,
+    std::chrono::milliseconds timeout = 1s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!value.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    return value.load(std::memory_order_acquire);
+}
+
+personal_cloud::HttpResponse async_test_response(std::string body) {
+    return {
+        200,
+        "OK",
+        "text/plain; charset=utf-8",
+        std::move(body),
+    };
+}
+
+void test_blocked_application_task_does_not_block_epoll() {
+    auto task_started = std::make_shared<std::atomic<bool>>(false);
+    auto release_task = std::make_shared<std::atomic<bool>>(false);
+    RunningServer server(
+        true,
+        128,
+        {},
+        [task_started, release_task](
+            const personal_cloud::HttpRequest& request)
+            -> std::optional<personal_cloud::ApplicationTask> {
+            if (request.path == "/api/factory-throw") {
+                throw std::runtime_error("intentional task factory failure");
+            }
+            if (request.path == "/api/task-throw") {
+                return []() -> personal_cloud::HttpResponse {
+                    throw std::runtime_error("intentional worker task failure");
+                };
+            }
+            if (request.path != "/api/slow") {
+                return std::nullopt;
+            }
+            return [task_started, release_task] {
+                task_started->store(true, std::memory_order_release);
+                while (!release_task->load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(1ms);
+                }
+                return async_test_response("slow complete\n");
+            };
+        },
+        1,
+        4);
+    expect(server.started(), "start a server with one application worker");
+    if (!server.started()) {
+        return;
+    }
+
+    FileDescriptor slow_client = connect_to_server(server.port());
+    const bool slow_sent = slow_client && send_bytes(
+        slow_client.get(),
+        "GET /api/slow HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const bool started = slow_sent && wait_until_true(*task_started);
+
+    const auto health_start = std::chrono::steady_clock::now();
+    const ExchangeResult health = exchange(
+        server.port(),
+        {"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"});
+    const auto health_duration =
+        std::chrono::steady_clock::now() - health_start;
+    expect(started && has_status(health, "HTTP/1.1 200 OK\r\n") &&
+               health_duration < 500ms,
+           "keep synchronous health checks responsive while a worker blocks");
+
+    release_task->store(true, std::memory_order_release);
+    bool slow_received = false;
+    const std::string slow_response = slow_client
+                                          ? receive_until_closed(
+                                                slow_client.get(),
+                                                slow_received)
+                                          : std::string{};
+    expect(slow_received &&
+               slow_response.starts_with("HTTP/1.1 200 OK\r\n") &&
+               slow_response.ends_with("slow complete\n"),
+           "deliver a worker response through the eventfd completion queue");
+
+    const ExchangeResult task_failure = exchange(
+        server.port(),
+        {"GET /api/task-throw HTTP/1.1\r\nHost: localhost\r\n\r\n"});
+    expect(has_status(
+               task_failure,
+               "HTTP/1.1 500 Internal Server Error\r\n"),
+           "contain a worker task exception and return 500");
+
+    const ExchangeResult factory_failure = exchange(
+        server.port(),
+        {"GET /api/factory-throw HTTP/1.1\r\nHost: localhost\r\n\r\n"});
+    expect(has_status(
+               factory_failure,
+               "HTTP/1.1 500 Internal Server Error\r\n"),
+           "contain a task factory exception and return 500");
+    expect(server.stop_with_signal() == 0,
+           "stop normally after an asynchronous task");
+}
+
+void test_full_application_queue_returns_503() {
+    auto first_started = std::make_shared<std::atomic<bool>>(false);
+    auto release_tasks = std::make_shared<std::atomic<bool>>(false);
+    RunningServer server(
+        true,
+        128,
+        {},
+        [first_started, release_tasks](
+            const personal_cloud::HttpRequest& request)
+            -> std::optional<personal_cloud::ApplicationTask> {
+            if (!request.path.starts_with("/api/queued/")) {
+                return std::nullopt;
+            }
+            const std::string path = request.path;
+            return [first_started, release_tasks, path] {
+                first_started->store(true, std::memory_order_release);
+                while (!release_tasks->load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(1ms);
+                }
+                return async_test_response(path + "\n");
+            };
+        },
+        1,
+        1);
+    expect(server.started(), "start a server with a one-entry task queue");
+    if (!server.started()) {
+        return;
+    }
+
+    FileDescriptor active = connect_to_server(server.port());
+    const bool active_sent = active && send_bytes(
+        active.get(),
+        "GET /api/queued/active HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const bool active_started = active_sent && wait_until_true(*first_started);
+
+    FileDescriptor queued = connect_to_server(server.port());
+    const bool queued_sent = queued && send_bytes(
+        queued.get(),
+        "GET /api/queued/waiting HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    std::this_thread::sleep_for(20ms);
+    const ExchangeResult overflow = exchange(
+        server.port(),
+        {"GET /api/queued/overflow HTTP/1.1\r\nHost: localhost\r\n\r\n"});
+    expect(active_started && queued_sent &&
+               has_status(
+                   overflow,
+                   "HTTP/1.1 503 Service Unavailable\r\n"),
+           "return 503 when the bounded application queue is full");
+
+    release_tasks->store(true, std::memory_order_release);
+    bool active_received = false;
+    bool queued_received = false;
+    const std::string active_response = active
+                                            ? receive_until_closed(
+                                                  active.get(),
+                                                  active_received)
+                                            : std::string{};
+    const std::string queued_response = queued
+                                            ? receive_until_closed(
+                                                  queued.get(),
+                                                  queued_received)
+                                            : std::string{};
+    expect(active_received && queued_received &&
+               active_response.ends_with("/api/queued/active\n") &&
+               queued_response.ends_with("/api/queued/waiting\n"),
+           "preserve accepted tasks when rejecting queue overflow");
+    expect(server.stop_with_signal() == 0,
+           "stop normally after task queue saturation");
+}
+
+void test_stale_task_completion_is_discarded() {
+    auto old_started = std::make_shared<std::atomic<bool>>(false);
+    auto release_old = std::make_shared<std::atomic<bool>>(false);
+    RunningServer server(
+        true,
+        128,
+        {},
+        [old_started, release_old](
+            const personal_cloud::HttpRequest& request)
+            -> std::optional<personal_cloud::ApplicationTask> {
+            if (request.path != "/api/old") {
+                return std::nullopt;
+            }
+            return [old_started, release_old] {
+                old_started->store(true, std::memory_order_release);
+                while (!release_old->load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(1ms);
+                }
+                return async_test_response("OLD RESPONSE MUST NOT LEAK\n");
+            };
+        },
+        1,
+        2);
+    expect(server.started(), "start a server for stale completion testing");
+    if (!server.started()) {
+        return;
+    }
+
+    FileDescriptor old_client = connect_to_server(server.port());
+    const bool old_sent = old_client && send_bytes(
+        old_client.get(),
+        "GET /api/old HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const bool started = old_sent && wait_until_true(*old_started);
+    old_client.reset();
+
+    // processing 连接会按 idle timeout 回收；随后建立的新连接很可能复用同一个
+    // 服务端 fd。连接 ID 必须阻止旧任务的完成结果命中新连接。
+    std::this_thread::sleep_for(1200ms);
+    FileDescriptor replacement = connect_to_server(server.port());
+    const bool partial_sent = replacement && send_bytes(
+        replacement.get(), "GET /health HTTP/1.1\r\n");
+    release_old->store(true, std::memory_order_release);
+    std::this_thread::sleep_for(50ms);
+
+    const bool request_completed = partial_sent && send_bytes(
+        replacement.get(), "Host: localhost\r\n\r\n");
+    bool replacement_received = false;
+    const std::string replacement_response = replacement
+                                                 ? receive_until_closed(
+                                                       replacement.get(),
+                                                       replacement_received)
+                                                 : std::string{};
+    expect(started && request_completed && replacement_received &&
+               replacement_response.starts_with("HTTP/1.1 200 OK\r\n") &&
+               replacement_response.ends_with("OK\n") &&
+               replacement_response.find("OLD RESPONSE") == std::string::npos,
+           "discard a late completion after the original connection is gone");
+    expect(server.stop_with_signal() == 0,
+           "stop normally after discarding a stale completion");
+}
+
+std::string response_header_value(
+    const ExchangeResult& result,
+    std::string_view name) {
+    const std::string prefix = "\r\n" + std::string(name) + ": ";
+    const std::size_t start = result.response.find(prefix);
+    if (start == std::string::npos) {
+        return {};
+    }
+    const std::size_t value_start = start + prefix.size();
+    const std::size_t value_end = result.response.find("\r\n", value_start);
+    if (value_end == std::string::npos) {
+        return {};
+    }
+    return result.response.substr(value_start, value_end - value_start);
+}
+
+ExchangeResult json_exchange(
+    std::uint16_t port,
+    std::string_view path,
+    std::string_view body,
+    std::string_view cookie = {}) {
+    std::string request = "POST ";
+    request += path;
+    request += " HTTP/1.1\r\nHost: localhost\r\n";
+    request += "Content-Type: application/json\r\nContent-Length: ";
+    request += std::to_string(body.size());
+    request += "\r\n";
+    if (!cookie.empty()) {
+        request += "Cookie: ";
+        request += cookie;
+        request += "\r\n";
+    }
+    request += "\r\n";
+    request += body;
+    return exchange(port, {request});
+}
+
+void test_live_authentication_api() {
+    std::string pattern =
+        (std::filesystem::temp_directory_path() /
+         "personal-cloud-auth-integration-XXXXXX")
+            .string();
+    pattern.push_back('\0');
+    char* directory = ::mkdtemp(pattern.data());
+    expect(directory != nullptr,
+           "create a temporary directory for live authentication");
+    if (directory == nullptr) {
+        return;
+    }
+    const std::filesystem::path temporary_path(directory);
+
+    personal_cloud::BackendConfig config;
+    config.database_path = temporary_path / "auth.db";
+    config.storage_root = temporary_path / "files";
+    personal_cloud::BackendApplication application(config);
+    RunningServer server(
+        true,
+        128,
+        [&application](const personal_cloud::HttpRequest& request) {
+            return application.handle_request(request);
+        },
+        [&application](const personal_cloud::HttpRequest& request) {
+            return application.make_task(request);
+        },
+        2,
+        16,
+        5s);
+    expect(server.started(), "start the real authentication application");
+    if (!server.started()) {
+        std::error_code error;
+        std::filesystem::remove_all(temporary_path, error);
+        return;
+    }
+
+    ExchangeResult response = json_exchange(
+        server.port(),
+        "/api/auth/register",
+        "{\"username\":\"LiveUser\","
+        "\"password\":\"live-user-password\"}");
+    expect(has_status(response, "HTTP/1.1 201 Created\r\n"),
+           "register through the real HTTP parser and epoll worker bridge");
+
+    response = json_exchange(
+        server.port(),
+        "/api/auth/login",
+        "{\"username\":\"LiveUser\","
+        "\"password\":\"live-user-password\"}");
+    const std::string set_cookie =
+        response_header_value(response, "Set-Cookie");
+    const std::string cookie = set_cookie.substr(0, set_cookie.find(';'));
+    expect(has_status(response, "HTTP/1.1 200 OK\r\n") &&
+               cookie.starts_with("pc_session=") &&
+               set_cookie.find("HttpOnly") != std::string::npos,
+           "receive a hardened session cookie over real HTTP");
+
+    std::string me_request =
+        "GET /api/auth/me HTTP/1.1\r\nHost: localhost\r\nCookie: ";
+    me_request += cookie;
+    me_request += "\r\n\r\n";
+    response = exchange(server.port(), {me_request});
+    expect(has_status(response, "HTTP/1.1 200 OK\r\n") &&
+               response.response.find("\"username\":\"LiveUser\"") !=
+                   std::string::npos,
+           "authenticate a real request with the issued cookie");
+
+    response = json_exchange(
+        server.port(), "/api/auth/logout", "", cookie);
+    expect(has_status(response, "HTTP/1.1 200 OK\r\n") &&
+               response_header_value(response, "Set-Cookie")
+                       .find("Max-Age=0") != std::string::npos,
+           "logout and clear the cookie over real HTTP");
+
+    response = exchange(server.port(), {me_request});
+    expect(has_status(response, "HTTP/1.1 401 Unauthorized\r\n"),
+           "reject the logged-out cookie over real HTTP");
+    expect(server.stop_with_signal() == 0,
+           "stop normally after the live authentication flow");
+
+    std::error_code error;
+    std::filesystem::remove_all(temporary_path, error);
+}
+
 }  // namespace
 
 int main() {
@@ -656,6 +1023,10 @@ int main() {
     test_stop_token_shutdown();
     test_connection_limit();
     test_application_handler_injection();
+    test_blocked_application_task_does_not_block_epoll();
+    test_full_application_queue_returns_503();
+    test_stale_task_completion_is_discarded();
+    test_live_authentication_api();
 
     if (failure_count != 0) {
         std::cerr << failure_count << " integration assertion(s) failed.\n";

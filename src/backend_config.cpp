@@ -129,6 +129,27 @@ ConfigParseResult parse_backend_config(
             continue;
         }
 
+        if (option == "--worker-count" || option == "--task-queue-size") {
+            if (++index >= arguments.size()) {
+                return missing_value(option);
+            }
+            std::size_t value = 0;
+            if (!parse_positive_integer(arguments[index], value)) {
+                return {
+                    std::nullopt,
+                    "Invalid value for " + std::string(option) + ": " +
+                        std::string(arguments[index]),
+                    false,
+                };
+            }
+            if (option == "--worker-count") {
+                config.server.application_worker_count = value;
+            } else {
+                config.server.application_queue_size = value;
+            }
+            continue;
+        }
+
         return {
             std::nullopt,
             "Unknown option: " + std::string(option),
@@ -150,6 +171,8 @@ std::string backend_usage(std::string_view program_name) {
     usage += "  --storage-root <path>     Stored file directory\n";
     usage += "  --max-connections <count> Active connection limit\n";
     usage += "  --idle-timeout <seconds>  Connection idle timeout\n";
+    usage += "  --worker-count <count>     Application worker threads (default: 4)\n";
+    usage += "  --task-queue-size <count>  Pending task limit (default: 256)\n";
     usage += "  --verbose                  Enable per-connection logging\n";
     usage += "  --help, -h                 Show this help\n";
     return usage;

@@ -3,11 +3,13 @@
 这是一个用于学习 Linux 网络编程和 HTTP 的 C++ 项目。
 
 当前进度：已经完成非阻塞 Socket、epoll 事件循环、HTTP Request/Response、
-路由、超时清理、优雅停机、SQLite 基础持久化和端到端测试。服务器使用单线程
-epoll 管理大量连接，不会让一个慢客户端阻塞其他客户端。请求解析器支持
+路由、超时清理、优雅停机、SQLite 持久化、异步任务桥、用户/Session 认证和
+端到端测试。
+服务器使用单线程 epoll 管理大量连接，不会让一个慢客户端阻塞其他客户端。
+请求解析器支持
 Header、`Content-Length`
 和 Body，并严格检查 HTTP/1.x 请求行、Host、Header 控制字符和消息长度。
-服务器可以处理 GET，以及在内存中接收简单的 `text/plain` POST 内容。
+服务器可以处理 GET、认证 JSON API，以及在内存中接收简单的 `text/plain` POST。
 
 ## 当前结构
 
@@ -19,7 +21,7 @@ Header、`Content-Length`
 ├── README.md       # 当前进度和学习任务
 ├── guide.md        # 项目整体规划
 ├── include/
-│   ├── app/         # 后端配置和应用层请求入口
+│   ├── app/         # 后端配置、认证服务和应用层请求入口
 │   ├── concurrency/
 │   │   └── thread_pool.h   # 有界线程池接口
 │   ├── http/
@@ -35,6 +37,7 @@ Header、`Content-Length`
 ├── src/
 │   ├── backend_application.cpp # 应用路由和 JSON 状态接口
 │   ├── backend_config.cpp   # 命令行配置解析
+│   ├── auth_service.cpp     # 注册、登录、Session 和限速
 │   ├── client_handler.cpp  # 旧阻塞式客户端处理流程（学习对照）
 │   ├── database.cpp        # SQLite 配置和版本化迁移
 │   ├── epoll_server.cpp    # 非阻塞收发、连接状态和 epoll 事件循环
@@ -42,7 +45,7 @@ Header、`Content-Length`
 │   ├── http_response.cpp   # HTTP 响应序列化
 │   ├── http_server.cpp     # Socket 层系统调用及错误处理
 │   ├── router.cpp          # method/path 匹配和响应生成
-│   ├── thread_pool.cpp     # 旧线程池实现，保留测试和模型对照
+│   ├── thread_pool.cpp     # 异步应用任务使用的有界工作线程池
 │   └── main.cpp            # 设置参数并启动 epoll 服务器
 └── tests/
     ├── backend_test.cpp     # 配置、迁移、持久化和应用接口测试
@@ -53,10 +56,10 @@ Header、`Content-Length`
 
 ## 构建
 
-Ubuntu/Debian 需要先安装 SQLite 开发包：
+Ubuntu/Debian 需要先安装 SQLite、libsodium 和 nlohmann JSON 开发包：
 
 ```bash
-sudo apt-get install libsqlite3-dev
+sudo apt-get install libsqlite3-dev libsodium-dev nlohmann-json3-dev pkg-config
 ```
 
 ```bash
@@ -93,13 +96,19 @@ ctest --test-dir build --output-on-failure
     --database data/personal_cloud.db \
     --storage-root data/files \
     --max-connections 10000 \
-    --idle-timeout 30
+    --idle-timeout 30 \
+    --worker-count 4 \
+    --task-queue-size 256
 ```
 
 使用 `./build/http_server --help` 可以查看全部选项。非法配置会在创建监听
 Socket 前被拒绝。首次启动时会自动创建数据库目录、文件存储目录和 Schema；
 当前第一版迁移包含 `users`、`sessions`、`files` 及必要索引。SQLite 会启用
 外键、WAL 和 5 秒 busy timeout。
+
+可能访问数据库或文件系统的请求通过有界应用工作线程池执行。等待队列满时服务
+返回 `503 Service Unavailable`，不会继续无界积累任务。`/health` 等纯内存快速
+路由仍由 epoll 线程直接处理，因此某个 worker 阻塞不会阻塞新连接的健康检查。
 
 ## 运行和验证
 
@@ -122,6 +131,54 @@ curl http://127.0.0.1:9000/api/status
 ```json
 {"status":"ok","database":"ok","schema_version":1}
 ```
+
+`/api/status` 已接入异步任务桥。worker 通过完成队列和 Linux `eventfd` 把响应
+交还给 epoll 线程；worker 不直接操作 Socket。每个连接使用独立的 64 位连接 ID，
+避免 fd 复用后把旧任务响应发送给新客户端。
+
+## 用户认证 API
+
+注册：
+
+```bash
+curl -i \
+    -H 'Content-Type: application/json' \
+    --data-binary '{"username":"alice","password":"example-password"}' \
+    http://127.0.0.1:9000/api/auth/register
+```
+
+登录并把 Session Cookie 保存到临时 Cookie Jar：
+
+```bash
+curl -i -c /tmp/personal-cloud-cookie.txt \
+    -H 'Content-Type: application/json' \
+    --data-binary '{"username":"alice","password":"example-password"}' \
+    http://127.0.0.1:9000/api/auth/login
+```
+
+查询当前用户、退出并验证 Session 已失效：
+
+```bash
+curl -i -b /tmp/personal-cloud-cookie.txt \
+    http://127.0.0.1:9000/api/auth/me
+
+curl -i -b /tmp/personal-cloud-cookie.txt -X POST \
+    http://127.0.0.1:9000/api/auth/logout
+
+curl -i -b /tmp/personal-cloud-cookie.txt \
+    http://127.0.0.1:9000/api/auth/me
+```
+
+用户名只允许 3–64 个 ASCII 字母、数字、点、下划线和连字符；密码长度为
+8–1024 字节。密码通过 libsodium Argon2id 存储，明文不会写入数据库。Session
+Token 使用 32 字节安全随机数，只通过 `Set-Cookie` 发给客户端；数据库仅保存其
+32 字节 BLAKE2b 哈希。Cookie 带 `HttpOnly`、`SameSite=Strict`、`Path=/` 和
+7 天 `Max-Age`。
+
+本地服务器使用明文 HTTP，因此应用不直接添加 `Secure`。生产环境必须使用 HTTPS
+前置代理，并为 `pc_session` Cookie 添加 `Secure`；例如支持
+`proxy_cookie_flags pc_session secure` 的 Nginx 配置。登录对不存在用户和密码错误
+返回相同响应，并对连续失败进行有界内存限速。
 
 在另一个终端使用 netcat 连接：
 
@@ -180,9 +237,10 @@ hello upload
 HTTP/1.1 请求会立即返回 `417`，避免客户端和服务器互相等待。已知路由的
 `405` 响应会带正确的 `Allow` Header，查询字符串不会影响路由路径匹配。
 
-事件循环记录每个连接最后一次成功收发数据的时间。接收阶段空闲 30 秒时返回
-`408 Request Timeout`；发送阶段空闲 30 秒时直接关闭连接。超时检查每秒最多
-执行一次，避免高并发时为每一批事件重复扫描连接表。
+事件循环记录每个连接最后一次活动时间。接收阶段空闲 30 秒时返回
+`408 Request Timeout`；应用处理或发送阶段超时则直接关闭连接，迟到的 worker
+结果会被丢弃。超时检查每秒最多执行一次，避免高并发时为每一批事件重复扫描
+连接表。
 
 事件循环保留一个指向 `/dev/null` 的文件描述符。当进程遇到 `EMFILE` 或系统
 遇到 `ENFILE` 时，会用该保留槽接受并关闭一个排队连接、暂停监听，然后在
@@ -199,13 +257,15 @@ accept 队列，但会立即关闭超出的连接，防止连接状态无界增�
 2. `http_request.h/.cpp` 解析请求行、Header、`Content-Length` 和 Body。
 3. `router.h/.cpp` 根据 method 和 path 选择响应。
 4. `http_response.h/.cpp` 把响应对象序列化为 HTTP 文本。
-5. `epoll_server.h/.cpp` 保存每个连接的接收/发送状态，调度非阻塞 IO，处理
-   信号停机和描述符耗尽恢复，并调用注入的应用请求处理器。
-6. `backend_config` 解析启动配置；`database` 初始化 SQLite 并执行迁移；
-   `backend_application` 提供 `/api/status` 并把其他请求交给原有路由。
+5. `epoll_server.h/.cpp` 保存连接的接收、处理和发送状态，调度非阻塞 IO，处理
+   信号停机和描述符耗尽恢复，并通过有界线程池、完成队列和 `eventfd` 调度
+   可能阻塞的应用任务。
+6. `backend_config` 解析启动配置；`database` 初始化 SQLite、执行迁移并提供全部
+   绑定参数认证查询；`auth_service` 负责 Argon2id、Session 和失败限速；
+   `backend_application` 把这些操作封装为 worker 任务。
 7. `main.cpp` 组装配置、数据库、应用处理器和事件循环。
-8. `client_handler` 和 `thread_pool` 保留作为旧并发模型的学习对照，不参与
-   `http_server` 可执行程序的构建。
+8. `thread_pool` 执行异步应用任务；`client_handler` 只作为旧阻塞模型的学习
+   对照，不参与 `http_server` 可执行程序的构建。
 
 当前接口包括：
 
@@ -226,12 +286,14 @@ accept 队列，但会立即关闭超出的连接，防止连接状态无界增�
 - 为什么 `send_all()` 需要循环调用 `send()`。
 - 为什么 ET 模式下必须一直 `accept()`、`recv()` 或 `send()` 到 `EAGAIN`。
 - 为什么连接状态中需要分别保存请求缓冲区、响应缓冲区和发送偏移量。
+- 为什么 worker 只能通过完成队列和 `eventfd` 通知 epoll，不能直接操作 Socket。
+- 为什么任务结果除 fd 外还必须携带连接 ID，防止 fd 复用造成串响应。
 - 为什么 `EMFILE` 时需要保留 fd、暂停监听和显式重新启用 one-shot 事件。
 - 为什么用 `signalfd` 可以让信号处理保持在普通同步代码中。
 
-后端后续顺序和各阶段验收标准见 `BACKEND_PLAN.md`。下一步是用有界线程池、
-完成队列和 `eventfd` 把数据库/文件任务移出 epoll 线程，然后再实现注册、登录
-和 Session；不应直接在当前事件循环里执行密码哈希或耗时数据库操作。
+后端后续顺序和各阶段验收标准见 `BACKEND_PLAN.md`。认证闭环已经完成，下一步是
+阶段 4 的文件元数据和流式上传。上传不能复用当前 64 KiB 普通请求 Body 路径，
+需要单独设计临时文件、增量哈希和读取背压状态。
 
 ## 学习约定
 
