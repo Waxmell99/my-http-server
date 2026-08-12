@@ -1,5 +1,6 @@
 #include "server/epoll_server.h"
 
+#include "http/router.h"
 #include "server/http_server.h"
 
 #include <algorithm>
@@ -10,7 +11,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -239,7 +242,9 @@ class RunningServer final {
 public:
     explicit RunningServer(
         bool handle_termination_signals = true,
-        std::size_t maximum_connections = 128)
+        std::size_t maximum_connections = 128,
+        std::function<personal_cloud::HttpResponse(
+            const personal_cloud::HttpRequest&)> request_handler = {})
         : port_(find_available_port()) {
         if (port_ == 0) {
             return;
@@ -251,6 +256,7 @@ public:
         config.maximum_connections = maximum_connections;
         config.idle_timeout = 1s;
         config.handle_termination_signals = handle_termination_signals;
+        config.request_handler = std::move(request_handler);
         thread_ = std::jthread([this, config](std::stop_token token) {
             result_.store(
                 personal_cloud::run_epoll_server(config, token),
@@ -534,6 +540,45 @@ void test_connection_limit() {
            "stop normally after enforcing the connection limit");
 }
 
+void test_application_handler_injection() {
+    RunningServer server(
+        true,
+        128,
+        [](const personal_cloud::HttpRequest& request) {
+            if (request.path == "/api/test") {
+                return personal_cloud::HttpResponse{
+                    200,
+                    "OK",
+                    "application/json; charset=utf-8",
+                    "{\"injected\":true}\n",
+                };
+            }
+            if (request.path == "/api/throw") {
+                throw std::runtime_error("intentional test failure");
+            }
+            return personal_cloud::route_request(request);
+        });
+    expect(server.started(), "start a server with an application handler");
+    if (!server.started()) {
+        return;
+    }
+
+    ExchangeResult result = exchange(
+        server.port(),
+        {"GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n"});
+    expect(has_status(result, "HTTP/1.1 200 OK\r\n") &&
+               result.response.ends_with("{\"injected\":true}\n"),
+           "dispatch through the injected application handler");
+
+    result = exchange(
+        server.port(),
+        {"GET /api/throw HTTP/1.1\r\nHost: localhost\r\n\r\n"});
+    expect(has_status(result, "HTTP/1.1 500 Internal Server Error\r\n"),
+           "contain an application exception and return 500");
+    expect(server.stop_with_signal() == 0,
+           "stop normally after application handler requests");
+}
+
 }  // namespace
 
 int main() {
@@ -610,6 +655,7 @@ int main() {
     test_descriptor_exhaustion_recovery();
     test_stop_token_shutdown();
     test_connection_limit();
+    test_application_handler_injection();
 
     if (failure_count != 0) {
         std::cerr << failure_count << " integration assertion(s) failed.\n";

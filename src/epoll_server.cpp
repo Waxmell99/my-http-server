@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <pthread.h>
@@ -547,7 +548,7 @@ private:
                         " bytes\n");
                 }
                 return queue_response(
-                    client_fd, connection, route_request(request));
+                    client_fd, connection, dispatch_request(request));
             }
 
             if (received == 0) {
@@ -611,6 +612,30 @@ private:
                 '\n');
         }
         return false;
+    }
+
+    HttpResponse dispatch_request(const HttpRequest& request) {
+        try {
+            if (config_.request_handler) {
+                return config_.request_handler(request);
+            }
+            return route_request(request);
+        } catch (const std::exception& error) {
+            write_log(
+                std::cerr,
+                "Request handler failed: ",
+                error.what(),
+                '\n');
+        } catch (...) {
+            write_log(
+                std::cerr,
+                "Request handler failed with an unknown exception.\n");
+        }
+
+        return make_error_response(
+            500,
+            "Internal Server Error",
+            "Internal Server Error\n");
     }
 
     bool queue_response(

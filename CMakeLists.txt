@@ -4,6 +4,7 @@ cmake_minimum_required(VERSION 3.20)
 project(personal_cloud_server VERSION 0.1.0 LANGUAGES CXX)
 
 find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 # 生成 compile_commands.json，方便 clangd 等工具理解项目。
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -11,6 +12,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 定义最终生成的可执行程序，以及参与编译的源文件。
 add_executable(http_server
     src/main.cpp
+    src/backend_application.cpp
+    src/backend_config.cpp
+    src/database.cpp
     src/epoll_server.cpp
     src/http_server.cpp
     src/http_request.cpp
@@ -26,7 +30,7 @@ target_include_directories(http_server
     PRIVATE
         "${PROJECT_SOURCE_DIR}/include"
 )
-target_link_libraries(http_server PRIVATE Threads::Threads)
+target_link_libraries(http_server PRIVATE Threads::Threads SQLite::SQLite3)
 
 # GCC 和 Clang 使用的常见警告选项。
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -119,4 +123,34 @@ if(BUILD_TESTING)
 
     add_test(NAME server_integration_tests COMMAND server_integration_tests)
     set_tests_properties(server_integration_tests PROPERTIES TIMEOUT 15)
+
+    add_executable(backend_tests
+        tests/backend_test.cpp
+        src/backend_application.cpp
+        src/backend_config.cpp
+        src/database.cpp
+        src/http_response.cpp
+        src/router.cpp
+    )
+
+    target_compile_features(backend_tests PRIVATE cxx_std_20)
+    target_include_directories(backend_tests
+        PRIVATE
+            "${PROJECT_SOURCE_DIR}/include"
+    )
+    target_link_libraries(backend_tests PRIVATE SQLite::SQLite3 Threads::Threads)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(backend_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    add_test(NAME backend_tests COMMAND backend_tests)
+    set_tests_properties(backend_tests PROPERTIES
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    )
 endif()

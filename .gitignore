@@ -5,3 +5,6 @@
 *.log
 compile_commands.json
 .env
+AGENT_LOG.md
+guide.md
+BACKEND_PLAN.md
