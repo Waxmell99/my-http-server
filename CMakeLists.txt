@@ -20,6 +20,7 @@ add_executable(http_server
     src/auth_service.cpp
     src/database.cpp
     src/epoll_server.cpp
+    src/file_service.cpp
     src/http_server.cpp
     src/http_request.cpp
     src/http_response.cpp
@@ -113,6 +114,7 @@ if(BUILD_TESTING)
         src/backend_application.cpp
         src/database.cpp
         src/epoll_server.cpp
+        src/file_service.cpp
         src/http_server.cpp
         src/http_request.cpp
         src/http_response.cpp
@@ -143,7 +145,7 @@ if(BUILD_TESTING)
     endif()
 
     add_test(NAME server_integration_tests COMMAND server_integration_tests)
-    set_tests_properties(server_integration_tests PROPERTIES TIMEOUT 15)
+    set_tests_properties(server_integration_tests PROPERTIES TIMEOUT 30)
 
     add_executable(backend_tests
         tests/backend_test.cpp
@@ -151,6 +153,7 @@ if(BUILD_TESTING)
         src/backend_application.cpp
         src/backend_config.cpp
         src/database.cpp
+        src/file_service.cpp
         src/http_response.cpp
         src/router.cpp
     )

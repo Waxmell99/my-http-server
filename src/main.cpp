@@ -3,6 +3,7 @@
 #include "server/epoll_server.h"
 
 #include <exception>
+#include <cstdint>
 #include <iostream>
 #include <string_view>
 #include <utility>
@@ -40,6 +41,17 @@ int main(int argc, char* argv[]) {
                                                  const personal_cloud::HttpRequest&
                                                      request) {
             return application.make_task(request);
+        };
+        config.server.upload_task_factory = [&application](
+                                                const personal_cloud::HttpRequest&
+                                                    request,
+                                                std::uint64_t content_length) {
+            return application.make_upload_task(request, content_length);
+        };
+        config.server.download_task_factory = [&application](
+                                                  const personal_cloud::HttpRequest&
+                                                      request) {
+            return application.make_download_task(request);
         };
 
         return personal_cloud::run_epoll_server(config.server);

@@ -2,6 +2,7 @@
 
 #include "http/http_request.h"
 #include "http/http_response.h"
+#include "server/streaming.h"
 
 #include <chrono>
 #include <cstddef>
@@ -32,8 +33,15 @@ struct EpollServerConfig {
     // 任务工厂只应进行快速的路由判断和参数复制。返回任务时，任务会进入有界
     // 工作线程池；返回 nullopt 时，请求继续由上面的同步处理器处理。
     ApplicationTaskFactory request_task_factory;
+    // 流式上传工厂在 Header 完整、Body 尚未进入内存时调用。准备任务在 worker
+    // 执行鉴权和配额检查；每个后续块也由 worker 写盘。
+    UploadTaskFactory upload_task_factory;
+    // 流式下载工厂在普通请求解析完成后调用。worker 负责鉴权、打开文件和分块
+    // 读取，epoll 线程只发送已就绪的有界缓冲区。
+    DownloadTaskFactory download_task_factory;
     std::size_t application_worker_count{4};
     std::size_t application_queue_size{256};
+    std::size_t streaming_chunk_size{64 * 1024};
 };
 
 // 启动单线程 epoll 事件循环。请求停止时返回 0，初始化或等待事件失败时返回 1。

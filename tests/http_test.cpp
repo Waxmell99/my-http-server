@@ -217,6 +217,24 @@ void test_request_body() {
             4);
     expect(too_large == personal_cloud::HttpParseResult::payload_too_large,
            "reject a body larger than the configured limit");
+
+    std::size_t streamed_content_length = 0;
+    std::size_t streamed_body_offset = 0;
+    const std::string streamed_head =
+        "POST /api/files HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Length: 1000000\r\n\r\npartial";
+    const personal_cloud::HttpParseResult head_result =
+        personal_cloud::parse_http_request_head(
+            streamed_head,
+            request,
+            streamed_content_length,
+            streamed_body_offset);
+    expect(head_result == personal_cloud::HttpParseResult::complete &&
+               streamed_content_length == 1000000 &&
+               streamed_body_offset < streamed_head.size() &&
+               request.body.empty(),
+           "parse streaming request metadata before the full body arrives");
 }
 
 void test_routing() {
@@ -305,6 +323,14 @@ void test_response_serialization() {
 
     expect(serialized == expected,
            "serialize status line, headers, and body");
+
+    const std::string streamed_head =
+        personal_cloud::serialize_http_response_head(response, 1000000);
+    expect(streamed_head.find("Content-Length: 1000000\r\n") !=
+                   std::string::npos &&
+               streamed_head.ends_with("\r\n\r\n") &&
+               streamed_head.find("abc") == std::string::npos,
+           "serialize a streaming response head without buffering its body");
 }
 
 }  // namespace

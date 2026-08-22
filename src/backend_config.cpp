@@ -150,9 +150,67 @@ ConfigParseResult parse_backend_config(
             continue;
         }
 
+        if (option == "--max-file-size" || option == "--user-quota") {
+            if (++index >= arguments.size()) {
+                return missing_value(option);
+            }
+            std::uint64_t value = 0;
+            if (!parse_positive_integer(arguments[index], value)) {
+                return {
+                    std::nullopt,
+                    "Invalid value for " + std::string(option) + ": " +
+                        std::string(arguments[index]),
+                    false,
+                };
+            }
+            if (option == "--max-file-size") {
+                config.maximum_file_size = value;
+            } else {
+                config.user_quota = value;
+            }
+            continue;
+        }
+
+        if (option == "--max-concurrent-uploads" ||
+            option == "--stream-buffer-size") {
+            if (++index >= arguments.size()) {
+                return missing_value(option);
+            }
+            std::size_t value = 0;
+            if (!parse_positive_integer(arguments[index], value)) {
+                return {
+                    std::nullopt,
+                    "Invalid value for " + std::string(option) + ": " +
+                        std::string(arguments[index]),
+                    false,
+                };
+            }
+            if (option == "--max-concurrent-uploads") {
+                config.maximum_concurrent_uploads = value;
+            } else {
+                config.server.streaming_chunk_size = value;
+            }
+            continue;
+        }
+
         return {
             std::nullopt,
             "Unknown option: " + std::string(option),
+            false,
+        };
+    }
+
+    if (config.maximum_file_size > config.user_quota) {
+        return {
+            std::nullopt,
+            "Maximum file size cannot exceed user quota",
+            false,
+        };
+    }
+    if (config.server.streaming_chunk_size > 4 * 1024 * 1024) {
+        return {
+            std::nullopt,
+            "Stream buffer size cannot exceed 4194304 bytes",
             false,
         };
     }
@@ -173,6 +231,10 @@ std::string backend_usage(std::string_view program_name) {
     usage += "  --idle-timeout <seconds>  Connection idle timeout\n";
     usage += "  --worker-count <count>     Application worker threads (default: 4)\n";
     usage += "  --task-queue-size <count>  Pending task limit (default: 256)\n";
+    usage += "  --max-file-size <bytes>    Per-file upload limit (default: 1 GiB)\n";
+    usage += "  --user-quota <bytes>       Per-user stored byte limit (default: 10 GiB)\n";
+    usage += "  --max-concurrent-uploads <count> Global upload limit (default: 4)\n";
+    usage += "  --stream-buffer-size <bytes> Upload/download chunk limit (default: 64 KiB)\n";
     usage += "  --verbose                  Enable per-connection logging\n";
     usage += "  --help, -h                 Show this help\n";
     return usage;

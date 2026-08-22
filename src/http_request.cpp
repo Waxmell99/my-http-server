@@ -93,10 +93,11 @@ std::string_view trim_optional_whitespace(std::string_view value) {
 
 }  // namespace
 
-HttpParseResult parse_http_request(
+HttpParseResult parse_http_request_head(
     std::string_view raw_request,
     HttpRequest& request,
-    std::size_t maximum_body_size) {
+    std::size_t& content_length,
+    std::size_t& body_offset) {
     const std::size_t headers_end = raw_request.find("\r\n\r\n");
     if (headers_end == std::string_view::npos) {
         return HttpParseResult::incomplete;
@@ -198,7 +199,7 @@ HttpParseResult parse_http_request(
         return HttpParseResult::bad_request;
     }
 
-    std::size_t content_length = 0;
+    std::size_t parsed_content_length = 0;
     const auto content_length_header =
         parsed_request.headers.find("content-length");
     if (content_length_header != parsed_request.headers.end()) {
@@ -208,14 +209,10 @@ HttpParseResult parse_http_request(
         }
 
         const auto [end, error] = std::from_chars(
-            value.data(), value.data() + value.size(), content_length);
+            value.data(), value.data() + value.size(), parsed_content_length);
         if (error != std::errc{} || end != value.data() + value.size()) {
             return HttpParseResult::bad_request;
         }
-    }
-
-    if (content_length > maximum_body_size) {
-        return HttpParseResult::payload_too_large;
     }
 
     if (version == "HTTP/1.1" &&
@@ -226,14 +223,34 @@ HttpParseResult parse_http_request(
         return HttpParseResult::expectation_failed;
     }
 
-    const std::size_t body_start = headers_end + 4;
-    const std::size_t received_body_size = raw_request.size() - body_start;
+    request = std::move(parsed_request);
+    content_length = parsed_content_length;
+    body_offset = headers_end + 4;
+    return HttpParseResult::complete;
+}
+
+HttpParseResult parse_http_request(
+    std::string_view raw_request,
+    HttpRequest& request,
+    std::size_t maximum_body_size) {
+    HttpRequest parsed_request;
+    std::size_t content_length = 0;
+    std::size_t body_offset = 0;
+    const HttpParseResult head_result = parse_http_request_head(
+        raw_request, parsed_request, content_length, body_offset);
+    if (head_result != HttpParseResult::complete) {
+        return head_result;
+    }
+    if (content_length > maximum_body_size) {
+        return HttpParseResult::payload_too_large;
+    }
+    const std::size_t received_body_size = raw_request.size() - body_offset;
     if (received_body_size < content_length) {
         return HttpParseResult::incomplete;
     }
 
     parsed_request.body.assign(
-        raw_request.substr(body_start, content_length));
+        raw_request.substr(body_offset, content_length));
     request = std::move(parsed_request);
     return HttpParseResult::complete;
 }

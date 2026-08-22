@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 struct sqlite3;
 
@@ -29,6 +30,18 @@ struct SessionUser {
     std::int64_t id{0};
     std::string username;
     std::int64_t created_at{0};
+};
+
+struct StoredFile {
+    std::string id;
+    std::int64_t user_id{0};
+    std::string original_name;
+    std::string storage_key;
+    std::string mime_type;
+    std::int64_t size{0};
+    std::array<unsigned char, 32> sha256{};
+    std::int64_t created_at{0};
+    std::int64_t updated_at{0};
 };
 
 class Database final {
@@ -62,6 +75,23 @@ public:
         std::int64_t now) const;
     bool delete_session(const SessionTokenHash& token_hash);
     void delete_expired_sessions(std::int64_t now);
+
+    [[nodiscard]] std::int64_t total_file_size(std::int64_t user_id) const;
+    [[nodiscard]] bool create_file(const StoredFile& file);
+    [[nodiscard]] std::vector<StoredFile> list_files(
+        std::int64_t user_id,
+        std::size_t limit = 1000) const;
+    [[nodiscard]] std::optional<StoredFile> find_file(
+        std::string_view id,
+        std::int64_t user_id) const;
+    [[nodiscard]] bool rename_file(
+        std::string_view id,
+        std::int64_t user_id,
+        std::string_view original_name,
+        std::int64_t updated_at);
+    [[nodiscard]] bool delete_file(
+        std::string_view id,
+        std::int64_t user_id);
 
 private:
     void execute(const char* sql);

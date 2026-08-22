@@ -42,6 +42,10 @@ bool is_authentication_path(std::string_view path) {
            path == "/api/auth/logout" || path == "/api/auth/me";
 }
 
+bool is_file_path(std::string_view path) {
+    return path == "/api/files" || path.starts_with("/api/files/");
+}
+
 std::filesystem::path prepare_storage_root(
     const std::filesystem::path& storage_root) {
     std::error_code error;
@@ -111,6 +115,8 @@ BackendApplication::BackendApplication(const BackendConfig& config)
       database_(database_path_),
       storage_root_(prepare_storage_root(config.storage_root)),
       auth_service_(std::make_shared<AuthService>(database_path_)),
+      file_service_(std::make_shared<FileService>(
+          config, auth_service_, database_path_, storage_root_)),
       schema_version_(database_.schema_version()),
       database_ready_(database_.health_check()) {}
 
@@ -133,7 +139,14 @@ std::optional<ApplicationTask> BackendApplication::make_task(
         };
     }
 
-    if (path == "/" || path == "/turntable") {
+    if (is_file_path(path)) {
+        const std::shared_ptr<FileService> service = file_service_;
+        return [service, request] {
+            return service->handle_request(request);
+        };
+    }
+
+    if (path == "/" || path == "/turntable" || path == "/app") {
         if (request.method != "GET") {
             return std::nullopt;
         }
@@ -155,6 +168,17 @@ std::optional<ApplicationTask> BackendApplication::make_task(
     return [request, database_ready, schema_version] {
         return status_response(request, database_ready, schema_version);
     };
+}
+
+std::optional<UploadPreparationTask> BackendApplication::make_upload_task(
+    const HttpRequest& request,
+    std::uint64_t content_length) {
+    return file_service_->make_upload_task(request, content_length);
+}
+
+std::optional<DownloadPreparationTask> BackendApplication::make_download_task(
+    const HttpRequest& request) {
+    return file_service_->make_download_task(request);
 }
 
 int BackendApplication::schema_version() const {

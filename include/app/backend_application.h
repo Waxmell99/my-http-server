@@ -2,6 +2,7 @@
 
 #include "app/auth_service.h"
 #include "app/backend_config.h"
+#include "app/file_service.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "storage/database.h"
@@ -23,6 +24,11 @@ public:
     HttpResponse handle_request(const HttpRequest& request);
     [[nodiscard]] std::optional<ApplicationTask> make_task(
         const HttpRequest& request);
+    [[nodiscard]] std::optional<UploadPreparationTask> make_upload_task(
+        const HttpRequest& request,
+        std::uint64_t content_length);
+    [[nodiscard]] std::optional<DownloadPreparationTask> make_download_task(
+        const HttpRequest& request);
 
     [[nodiscard]] int schema_version() const;
     [[nodiscard]] const std::filesystem::path& storage_root() const noexcept;
@@ -34,6 +40,7 @@ private:
     Database database_;
     std::filesystem::path storage_root_;
     std::shared_ptr<AuthService> auth_service_;
+    std::shared_ptr<FileService> file_service_;
     int schema_version_{0};
     bool database_ready_{false};
 };

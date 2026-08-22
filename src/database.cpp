@@ -2,6 +2,8 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <string_view>
 #include <stdexcept>
@@ -77,6 +79,34 @@ private:
 std::runtime_error sqlite_error(sqlite3* connection, const char* operation) {
     return std::runtime_error(
         std::string(operation) + ": " + ::sqlite3_errmsg(connection));
+}
+
+StoredFile stored_file_from_row(sqlite3_stmt* statement) {
+    const auto text_column = [statement](int index) -> std::string {
+        const auto* value = reinterpret_cast<const char*>(
+            ::sqlite3_column_text(statement, index));
+        if (value == nullptr) {
+            throw std::runtime_error("Stored file contains a null text field");
+        }
+        return value;
+    };
+
+    StoredFile file;
+    file.id = text_column(0);
+    file.user_id = ::sqlite3_column_int64(statement, 1);
+    file.original_name = text_column(2);
+    file.storage_key = text_column(3);
+    file.mime_type = text_column(4);
+    file.size = ::sqlite3_column_int64(statement, 5);
+    const void* digest = ::sqlite3_column_blob(statement, 6);
+    const int digest_size = ::sqlite3_column_bytes(statement, 6);
+    if (digest == nullptr || digest_size != static_cast<int>(file.sha256.size())) {
+        throw std::runtime_error("Stored file contains an invalid SHA-256");
+    }
+    std::memcpy(file.sha256.data(), digest, file.sha256.size());
+    file.created_at = ::sqlite3_column_int64(statement, 7);
+    file.updated_at = ::sqlite3_column_int64(statement, 8);
+    return file;
 }
 
 }  // namespace
@@ -287,6 +317,132 @@ void Database::delete_expired_sessions(std::int64_t now) {
     if (::sqlite3_step(statement.get()) != SQLITE_DONE) {
         throw sqlite_error(connection_, "Cannot delete expired sessions");
     }
+}
+
+std::int64_t Database::total_file_size(std::int64_t user_id) const {
+    Statement statement(
+        connection_,
+        "SELECT COALESCE(SUM(size), 0) FROM files WHERE user_id = ?1;");
+    statement.bind_int64(1, user_id);
+    if (::sqlite3_step(statement.get()) != SQLITE_ROW) {
+        throw sqlite_error(connection_, "Cannot calculate file usage");
+    }
+    return ::sqlite3_column_int64(statement.get(), 0);
+}
+
+bool Database::create_file(const StoredFile& file) {
+    execute("BEGIN IMMEDIATE;");
+    try {
+        Statement statement(
+            connection_,
+            "INSERT INTO files(id, user_id, original_name, storage_key, "
+            "mime_type, size, sha256, created_at, updated_at) "
+            "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);");
+        statement.bind_text(1, file.id);
+        statement.bind_int64(2, file.user_id);
+        statement.bind_text(3, file.original_name);
+        statement.bind_text(4, file.storage_key);
+        statement.bind_text(5, file.mime_type);
+        statement.bind_int64(6, file.size);
+        statement.bind_blob(7, file.sha256);
+        statement.bind_int64(8, file.created_at);
+        statement.bind_int64(9, file.updated_at);
+
+        const int result = ::sqlite3_step(statement.get());
+        if (result != SQLITE_DONE) {
+            const int extended_error = ::sqlite3_extended_errcode(connection_);
+            if (extended_error == SQLITE_CONSTRAINT_UNIQUE ||
+                extended_error == SQLITE_CONSTRAINT_PRIMARYKEY) {
+                execute("ROLLBACK;");
+                return false;
+            }
+            throw sqlite_error(connection_, "Cannot create file metadata");
+        }
+        execute("COMMIT;");
+        return true;
+    } catch (...) {
+        try {
+            execute("ROLLBACK;");
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+std::vector<StoredFile> Database::list_files(
+    std::int64_t user_id,
+    std::size_t limit) const {
+    const std::size_t bounded_limit = std::min<std::size_t>(limit, 1000);
+    Statement statement(
+        connection_,
+        "SELECT id, user_id, original_name, storage_key, mime_type, size, "
+        "sha256, created_at, updated_at FROM files WHERE user_id = ?1 "
+        "ORDER BY created_at DESC, id DESC LIMIT ?2;");
+    statement.bind_int64(1, user_id);
+    statement.bind_int64(2, static_cast<std::int64_t>(bounded_limit));
+
+    std::vector<StoredFile> files;
+    files.reserve(bounded_limit);
+    while (true) {
+        const int result = ::sqlite3_step(statement.get());
+        if (result == SQLITE_DONE) {
+            return files;
+        }
+        if (result != SQLITE_ROW) {
+            throw sqlite_error(connection_, "Cannot list files");
+        }
+        files.push_back(stored_file_from_row(statement.get()));
+    }
+}
+
+std::optional<StoredFile> Database::find_file(
+    std::string_view id,
+    std::int64_t user_id) const {
+    Statement statement(
+        connection_,
+        "SELECT id, user_id, original_name, storage_key, mime_type, size, "
+        "sha256, created_at, updated_at FROM files "
+        "WHERE id = ?1 AND user_id = ?2;");
+    statement.bind_text(1, id);
+    statement.bind_int64(2, user_id);
+    const int result = ::sqlite3_step(statement.get());
+    if (result == SQLITE_DONE) {
+        return std::nullopt;
+    }
+    if (result != SQLITE_ROW) {
+        throw sqlite_error(connection_, "Cannot find file");
+    }
+    return stored_file_from_row(statement.get());
+}
+
+bool Database::rename_file(
+    std::string_view id,
+    std::int64_t user_id,
+    std::string_view original_name,
+    std::int64_t updated_at) {
+    Statement statement(
+        connection_,
+        "UPDATE files SET original_name = ?1, updated_at = ?2 "
+        "WHERE id = ?3 AND user_id = ?4;");
+    statement.bind_text(1, original_name);
+    statement.bind_int64(2, updated_at);
+    statement.bind_text(3, id);
+    statement.bind_int64(4, user_id);
+    if (::sqlite3_step(statement.get()) != SQLITE_DONE) {
+        throw sqlite_error(connection_, "Cannot rename file");
+    }
+    return ::sqlite3_changes(connection_) != 0;
+}
+
+bool Database::delete_file(std::string_view id, std::int64_t user_id) {
+    Statement statement(
+        connection_, "DELETE FROM files WHERE id = ?1 AND user_id = ?2;");
+    statement.bind_text(1, id);
+    statement.bind_int64(2, user_id);
+    if (::sqlite3_step(statement.get()) != SQLITE_DONE) {
+        throw sqlite_error(connection_, "Cannot delete file metadata");
+    }
+    return ::sqlite3_changes(connection_) != 0;
 }
 
 void Database::execute(const char* sql) {

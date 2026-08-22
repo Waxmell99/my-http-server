@@ -7,6 +7,7 @@
 #include "http/router.h"
 #include "server/http_server.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -55,6 +56,20 @@ enum class ConnectionState {
     receiving,
     processing,
     sending,
+    upload_preparing,
+    upload_receiving,
+    upload_writing,
+    download_preparing,
+    download_sending,
+    download_reading,
+};
+
+enum class CompletionKind {
+    response,
+    upload_prepared,
+    upload_chunk,
+    download_prepared,
+    download_chunk,
 };
 
 enum class SignalReadResult {
@@ -70,12 +85,23 @@ struct ClientConnection {
     std::size_t sent_size{0};
     Clock::time_point last_activity{Clock::now()};
     ConnectionState state{ConnectionState::receiving};
+    std::shared_ptr<UploadStream> upload_stream;
+    std::uint64_t upload_size{0};
+    std::uint64_t upload_received{0};
+    std::string pending_upload_bytes;
+    std::shared_ptr<DownloadStream> download_stream;
+    bool download_end_of_file{false};
 };
 
 struct TaskCompletion {
     int client_fd{-1};
     std::uint64_t connection_id{0};
-    HttpResponse response;
+    CompletionKind kind{CompletionKind::response};
+    std::optional<HttpResponse> response;
+    std::shared_ptr<UploadStream> upload_stream;
+    std::shared_ptr<DownloadStream> download_stream;
+    DownloadChunk download_chunk;
+    bool failed{false};
 };
 
 HttpResponse make_error_response(
@@ -88,6 +114,23 @@ HttpResponse make_error_response(
         "text/plain; charset=utf-8",
         std::move(body),
     };
+}
+
+std::string content_disposition(std::string_view name) {
+    std::string result = "attachment; filename=\"";
+    for (char character : name) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (character == '\\' || character == '"') {
+            result += '\\';
+            result += character;
+        } else if (byte >= 0x20U && byte < 0x7fU) {
+            result += character;
+        } else {
+            result += '_';
+        }
+    }
+    result += '"';
+    return result;
 }
 
 class EpollEventLoop final {
@@ -210,9 +253,11 @@ private:
             config_.maximum_events >
                 static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
             config_.idle_timeout <= std::chrono::seconds::zero() ||
-            (config_.request_task_factory &&
+            ((config_.request_task_factory || config_.upload_task_factory ||
+              config_.download_task_factory) &&
              (config_.application_worker_count == 0 ||
-              config_.application_queue_size == 0))) {
+              config_.application_queue_size == 0 ||
+              config_.streaming_chunk_size == 0))) {
             write_log(std::cerr, "Invalid epoll server configuration.\n");
             return false;
         }
@@ -265,7 +310,8 @@ private:
             }
         }
 
-        if (config_.request_task_factory) {
+        if (config_.request_task_factory || config_.upload_task_factory ||
+            config_.download_task_factory) {
             completion_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
             if (completion_fd_ == -1) {
                 std::perror("eventfd");
@@ -508,9 +554,15 @@ private:
         } else if (connection.state == ConnectionState::receiving &&
                    (event_flags & (EPOLLIN | EPOLLRDHUP)) != 0U) {
             keep_connection = receive_request(client_fd, connection);
+        } else if (connection.state == ConnectionState::upload_receiving &&
+                   (event_flags & (EPOLLIN | EPOLLRDHUP)) != 0U) {
+            keep_connection = receive_upload_chunk(client_fd, connection);
         } else if (connection.state == ConnectionState::sending &&
                    (event_flags & EPOLLOUT) != 0U) {
             keep_connection = send_response(client_fd, connection);
+        } else if (connection.state == ConnectionState::download_sending &&
+                   (event_flags & EPOLLOUT) != 0U) {
+            keep_connection = send_download_buffer(client_fd, connection);
         }
 
         if (keep_connection && (event_flags & EPOLLHUP) != 0U) {
@@ -547,6 +599,16 @@ private:
                             431,
                             "Request Header Fields Too Large",
                             "Request Header Fields Too Large\n"));
+                }
+
+                if (config_.upload_task_factory &&
+                    connection.request_buffer.find(header_terminator) !=
+                        std::string::npos) {
+                    const std::optional<bool> upload_started =
+                        try_begin_upload(client_fd, connection);
+                    if (upload_started.has_value()) {
+                        return *upload_started;
+                    }
                 }
 
                 HttpRequest request;
@@ -657,6 +719,239 @@ private:
         }
     }
 
+    std::optional<bool> try_begin_upload(
+        int client_fd,
+        ClientConnection& connection) {
+        HttpRequest request;
+        std::size_t content_length = 0;
+        std::size_t body_offset = 0;
+        const HttpParseResult result = parse_http_request_head(
+            connection.request_buffer,
+            request,
+            content_length,
+            body_offset);
+        if (result != HttpParseResult::complete) {
+            return std::nullopt;
+        }
+
+        std::optional<UploadPreparationTask> task;
+        try {
+            task = config_.upload_task_factory(
+                request, static_cast<std::uint64_t>(content_length));
+        } catch (const std::exception& error) {
+            write_log(
+                std::cerr,
+                "Upload task factory failed: ",
+                error.what(),
+                '\n');
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    500,
+                    "Internal Server Error",
+                    "Internal Server Error\n"));
+        } catch (...) {
+            write_log(
+                std::cerr,
+                "Upload task factory failed with an unknown exception.\n");
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    500,
+                    "Internal Server Error",
+                    "Internal Server Error\n"));
+        }
+        if (!task.has_value()) {
+            return std::nullopt;
+        }
+
+        const std::size_t buffered_body_size =
+            connection.request_buffer.size() - body_offset;
+        if (buffered_body_size > content_length) {
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    400, "Bad Request", "Bad Request\n"));
+        }
+
+        const std::uint64_t connection_id = connection.id;
+        const bool submitted = worker_pool_ != nullptr &&
+            worker_pool_->submit(
+                [this,
+                 client_fd,
+                 connection_id,
+                 preparation_task = std::move(*task)]() mutable {
+                    TaskCompletion completion;
+                    completion.client_fd = client_fd;
+                    completion.connection_id = connection_id;
+                    completion.kind = CompletionKind::upload_prepared;
+                    try {
+                        UploadPreparationResult preparation =
+                            preparation_task();
+                        if (std::holds_alternative<HttpResponse>(preparation)) {
+                            completion.response = std::move(
+                                std::get<HttpResponse>(preparation));
+                        } else {
+                            completion.upload_stream = std::move(
+                                std::get<std::shared_ptr<UploadStream>>(
+                                    preparation));
+                        }
+                    } catch (const std::exception& error) {
+                        write_log(
+                            std::cerr,
+                            "Upload preparation task failed: ",
+                            error.what(),
+                            '\n');
+                        completion.response = make_error_response(
+                            500,
+                            "Internal Server Error",
+                            "Internal Server Error\n");
+                    } catch (...) {
+                        write_log(
+                            std::cerr,
+                            "Upload preparation task failed with an unknown "
+                            "exception.\n");
+                        completion.response = make_error_response(
+                            500,
+                            "Internal Server Error",
+                            "Internal Server Error\n");
+                    }
+                    post_task_completion(std::move(completion));
+                });
+        if (!submitted) {
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    503,
+                    "Service Unavailable",
+                    "Application task queue is full\n"));
+        }
+
+        connection.pending_upload_bytes.assign(
+            connection.request_buffer.data() + body_offset,
+            buffered_body_size);
+        connection.upload_size = static_cast<std::uint64_t>(content_length);
+        connection.upload_received =
+            static_cast<std::uint64_t>(buffered_body_size);
+        connection.request_buffer.clear();
+        connection.state = ConnectionState::upload_preparing;
+        connection.last_activity = Clock::now();
+        return modify_client_events(
+            client_fd,
+            connection,
+            EPOLLRDHUP | EPOLLET,
+            "epoll_ctl pause client Socket for upload preparation");
+    }
+
+    bool receive_upload_chunk(
+        int client_fd,
+        ClientConnection& connection) {
+        if (!connection.upload_stream ||
+            connection.upload_received >= connection.upload_size) {
+            return false;
+        }
+        const std::uint64_t remaining =
+            connection.upload_size - connection.upload_received;
+        const std::size_t wanted = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, config_.streaming_chunk_size));
+        std::string chunk(wanted, '\0');
+        while (true) {
+            const ssize_t received =
+                ::recv(client_fd, chunk.data(), chunk.size(), 0);
+            if (received > 0) {
+                chunk.resize(static_cast<std::size_t>(received));
+                connection.upload_received +=
+                    static_cast<std::uint64_t>(received);
+                connection.last_activity = Clock::now();
+                const bool final_chunk =
+                    connection.upload_received == connection.upload_size;
+                return schedule_upload_chunk(
+                    client_fd,
+                    connection,
+                    std::move(chunk),
+                    final_chunk);
+            }
+            if (received == 0) {
+                return false;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return true;
+            }
+            std::perror("recv upload");
+            return false;
+        }
+    }
+
+    bool schedule_upload_chunk(
+        int client_fd,
+        ClientConnection& connection,
+        std::string chunk,
+        bool final_chunk) {
+        const std::uint64_t connection_id = connection.id;
+        const std::shared_ptr<UploadStream> stream = connection.upload_stream;
+        const bool submitted = stream && worker_pool_ != nullptr &&
+            worker_pool_->submit(
+                [this,
+                 client_fd,
+                 connection_id,
+                 stream,
+                 chunk = std::move(chunk),
+                 final_chunk]() mutable {
+                    TaskCompletion completion;
+                    completion.client_fd = client_fd;
+                    completion.connection_id = connection_id;
+                    completion.kind = CompletionKind::upload_chunk;
+                    try {
+                        completion.response =
+                            stream->append(chunk, final_chunk);
+                    } catch (const std::exception& error) {
+                        write_log(
+                            std::cerr,
+                            "Upload chunk task failed: ",
+                            error.what(),
+                            '\n');
+                        completion.response = make_error_response(
+                            500,
+                            "Internal Server Error",
+                            "Internal Server Error\n");
+                    } catch (...) {
+                        write_log(
+                            std::cerr,
+                            "Upload chunk task failed with an unknown "
+                            "exception.\n");
+                        completion.response = make_error_response(
+                            500,
+                            "Internal Server Error",
+                            "Internal Server Error\n");
+                    }
+                    post_task_completion(std::move(completion));
+                });
+        if (!submitted) {
+            connection.upload_stream.reset();
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    503,
+                    "Service Unavailable",
+                    "Application task queue is full\n"));
+        }
+        connection.state = ConnectionState::upload_writing;
+        connection.last_activity = Clock::now();
+        return modify_client_events(
+            client_fd,
+            connection,
+            EPOLLRDHUP | EPOLLET,
+            "epoll_ctl pause client Socket for upload write");
+    }
+
     bool send_response(int client_fd, ClientConnection& connection) {
         while (connection.sent_size < connection.response_buffer.size()) {
             const ssize_t sent = ::send(
@@ -696,6 +991,162 @@ private:
         return false;
     }
 
+    bool begin_download_preparation(
+        int client_fd,
+        ClientConnection& connection,
+        DownloadPreparationTask task) {
+        const std::uint64_t connection_id = connection.id;
+        const bool submitted = worker_pool_ != nullptr &&
+            worker_pool_->submit(
+                [this,
+                 client_fd,
+                 connection_id,
+                 preparation_task = std::move(task)]() mutable {
+                    TaskCompletion completion;
+                    completion.client_fd = client_fd;
+                    completion.connection_id = connection_id;
+                    completion.kind = CompletionKind::download_prepared;
+                    try {
+                        DownloadPreparationResult preparation =
+                            preparation_task();
+                        if (std::holds_alternative<HttpResponse>(preparation)) {
+                            completion.response = std::move(
+                                std::get<HttpResponse>(preparation));
+                        } else {
+                            completion.download_stream = std::move(
+                                std::get<std::shared_ptr<DownloadStream>>(
+                                    preparation));
+                        }
+                    } catch (const std::exception& error) {
+                        write_log(
+                            std::cerr,
+                            "Download preparation task failed: ",
+                            error.what(),
+                            '\n');
+                        completion.response = make_error_response(
+                            500,
+                            "Internal Server Error",
+                            "Internal Server Error\n");
+                    } catch (...) {
+                        write_log(
+                            std::cerr,
+                            "Download preparation task failed with an unknown "
+                            "exception.\n");
+                        completion.response = make_error_response(
+                            500,
+                            "Internal Server Error",
+                            "Internal Server Error\n");
+                    }
+                    post_task_completion(std::move(completion));
+                });
+        if (!submitted) {
+            return queue_response(
+                client_fd,
+                connection,
+                make_error_response(
+                    503,
+                    "Service Unavailable",
+                    "Application task queue is full\n"));
+        }
+        connection.state = ConnectionState::download_preparing;
+        connection.last_activity = Clock::now();
+        connection.request_buffer.clear();
+        return modify_client_events(
+            client_fd,
+            connection,
+            EPOLLRDHUP | EPOLLET,
+            "epoll_ctl pause client Socket for download preparation");
+    }
+
+    bool send_download_buffer(
+        int client_fd,
+        ClientConnection& connection) {
+        while (connection.sent_size < connection.response_buffer.size()) {
+            const ssize_t sent = ::send(
+                client_fd,
+                connection.response_buffer.data() + connection.sent_size,
+                connection.response_buffer.size() - connection.sent_size,
+                MSG_NOSIGNAL);
+            if (sent > 0) {
+                connection.sent_size += static_cast<std::size_t>(sent);
+                connection.last_activity = Clock::now();
+                continue;
+            }
+            if (sent == -1 && errno == EINTR) {
+                continue;
+            }
+            if (sent == -1 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return true;
+            }
+            if (sent == -1) {
+                std::perror("send download");
+            }
+            return false;
+        }
+
+        connection.response_buffer.clear();
+        connection.sent_size = 0;
+        if (connection.download_end_of_file) {
+            return false;
+        }
+        return schedule_download_read(client_fd, connection);
+    }
+
+    bool schedule_download_read(
+        int client_fd,
+        ClientConnection& connection) {
+        const std::uint64_t connection_id = connection.id;
+        const std::shared_ptr<DownloadStream> stream =
+            connection.download_stream;
+        const std::size_t chunk_size = config_.streaming_chunk_size;
+        const bool submitted = stream && worker_pool_ != nullptr &&
+            worker_pool_->submit(
+                [this,
+                 client_fd,
+                 connection_id,
+                 stream,
+                 chunk_size] {
+                    TaskCompletion completion;
+                    completion.client_fd = client_fd;
+                    completion.connection_id = connection_id;
+                    completion.kind = CompletionKind::download_chunk;
+                    try {
+                        completion.download_chunk =
+                            stream->read_chunk(chunk_size);
+                    } catch (const std::exception& error) {
+                        write_log(
+                            std::cerr,
+                            "Download read task failed: ",
+                            error.what(),
+                            '\n');
+                        completion.failed = true;
+                    } catch (...) {
+                        write_log(
+                            std::cerr,
+                            "Download read task failed with an unknown "
+                            "exception.\n");
+                        completion.failed = true;
+                    }
+                    post_task_completion(std::move(completion));
+                });
+        if (!submitted) {
+            write_log(
+                std::cerr,
+                "Cannot queue download read; closing client fd = ",
+                client_fd,
+                '\n');
+            return false;
+        }
+        connection.state = ConnectionState::download_reading;
+        connection.last_activity = Clock::now();
+        return modify_client_events(
+            client_fd,
+            connection,
+            EPOLLRDHUP | EPOLLET,
+            "epoll_ctl pause client Socket for download read");
+    }
+
     HttpResponse dispatch_request(const HttpRequest& request) {
         try {
             if (config_.request_handler) {
@@ -724,6 +1175,42 @@ private:
         int client_fd,
         ClientConnection& connection,
         const HttpRequest& request) {
+        if (config_.download_task_factory) {
+            try {
+                std::optional<DownloadPreparationTask> download_task =
+                    config_.download_task_factory(request);
+                if (download_task.has_value()) {
+                    return begin_download_preparation(
+                        client_fd, connection, std::move(*download_task));
+                }
+            } catch (const std::exception& error) {
+                write_log(
+                    std::cerr,
+                    "Download task factory failed: ",
+                    error.what(),
+                    '\n');
+                return queue_response(
+                    client_fd,
+                    connection,
+                    make_error_response(
+                        500,
+                        "Internal Server Error",
+                        "Internal Server Error\n"));
+            } catch (...) {
+                write_log(
+                    std::cerr,
+                    "Download task factory failed with an unknown "
+                    "exception.\n");
+                return queue_response(
+                    client_fd,
+                    connection,
+                    make_error_response(
+                        500,
+                        "Internal Server Error",
+                        "Internal Server Error\n"));
+            }
+        }
+
         if (!config_.request_task_factory) {
             return queue_response(
                 client_fd, connection, dispatch_request(request));
@@ -796,8 +1283,12 @@ private:
                             "Internal Server Error",
                             "Internal Server Error\n");
                     }
-                    post_task_completion(
-                        {client_fd, connection_id, std::move(response)});
+                    TaskCompletion completion;
+                    completion.client_fd = client_fd;
+                    completion.connection_id = connection_id;
+                    completion.kind = CompletionKind::response;
+                    completion.response = std::move(response);
+                    post_task_completion(std::move(completion));
                 });
 
         if (!submitted) {
@@ -881,17 +1372,166 @@ private:
         for (TaskCompletion& completion : ready) {
             const auto found = clients_.find(completion.client_fd);
             if (found == clients_.end() ||
-                found->second.id != completion.connection_id ||
-                found->second.state != ConnectionState::processing) {
+                found->second.id != completion.connection_id) {
                 continue;
             }
+            ClientConnection& connection = found->second;
+            bool keep_connection = true;
 
-            if (!queue_response(
+            if (completion.kind == CompletionKind::response) {
+                if (connection.state != ConnectionState::processing ||
+                    !completion.response.has_value()) {
+                    continue;
+                }
+                keep_connection = queue_response(
                     completion.client_fd,
-                    found->second,
-                    completion.response)) {
+                    connection,
+                    *completion.response);
+            } else if (completion.kind ==
+                       CompletionKind::upload_prepared) {
+                if (connection.state != ConnectionState::upload_preparing) {
+                    continue;
+                }
+                connection.last_activity = Clock::now();
+                if (completion.response.has_value()) {
+                    keep_connection = queue_response(
+                        completion.client_fd,
+                        connection,
+                        *completion.response);
+                } else if (!completion.upload_stream) {
+                    keep_connection = false;
+                } else {
+                    connection.upload_stream =
+                        std::move(completion.upload_stream);
+                    std::string buffered =
+                        std::move(connection.pending_upload_bytes);
+                    connection.pending_upload_bytes.clear();
+                    if (!buffered.empty() || connection.upload_size == 0) {
+                        const bool final_chunk =
+                            connection.upload_received ==
+                            connection.upload_size;
+                        keep_connection = schedule_upload_chunk(
+                            completion.client_fd,
+                            connection,
+                            std::move(buffered),
+                            final_chunk);
+                    } else {
+                        connection.state = ConnectionState::upload_receiving;
+                        keep_connection = modify_client_events(
+                            completion.client_fd,
+                            connection,
+                            EPOLLIN | EPOLLRDHUP | EPOLLET,
+                            "epoll_ctl resume upload receive");
+                    }
+                }
+            } else if (completion.kind == CompletionKind::upload_chunk) {
+                if (connection.state != ConnectionState::upload_writing) {
+                    continue;
+                }
+                connection.last_activity = Clock::now();
+                if (completion.response.has_value()) {
+                    connection.upload_stream.reset();
+                    keep_connection = queue_response(
+                        completion.client_fd,
+                        connection,
+                        *completion.response);
+                } else if (connection.upload_received >=
+                           connection.upload_size) {
+                    keep_connection = false;
+                } else {
+                    connection.state = ConnectionState::upload_receiving;
+                    keep_connection = modify_client_events(
+                        completion.client_fd,
+                        connection,
+                        EPOLLIN | EPOLLRDHUP | EPOLLET,
+                        "epoll_ctl resume upload receive");
+                }
+            } else if (completion.kind ==
+                       CompletionKind::download_prepared) {
+                if (connection.state != ConnectionState::download_preparing) {
+                    continue;
+                }
+                connection.last_activity = Clock::now();
+                if (completion.response.has_value()) {
+                    keep_connection = queue_response(
+                        completion.client_fd,
+                        connection,
+                        *completion.response);
+                } else if (!completion.download_stream) {
+                    keep_connection = false;
+                } else {
+                    connection.download_stream =
+                        std::move(completion.download_stream);
+                    const HttpResponse response_head{
+                        200,
+                        "OK",
+                        std::string(
+                            connection.download_stream->content_type()),
+                        {},
+                        {{"Content-Disposition",
+                          content_disposition(
+                              connection.download_stream->original_name())}},
+                    };
+                    connection.response_buffer = serialize_http_response_head(
+                        response_head, connection.download_stream->size());
+                    connection.sent_size = 0;
+                    connection.download_end_of_file =
+                        connection.download_stream->size() == 0;
+                    connection.state = ConnectionState::download_sending;
+                    keep_connection = modify_client_events(
+                        completion.client_fd,
+                        connection,
+                        EPOLLOUT | EPOLLRDHUP | EPOLLET,
+                        "epoll_ctl begin streaming download");
+                }
+            } else {
+                if (connection.state != ConnectionState::download_reading) {
+                    continue;
+                }
+                connection.last_activity = Clock::now();
+                if (completion.failed ||
+                    (completion.download_chunk.bytes.empty() &&
+                     !completion.download_chunk.end_of_file)) {
+                    keep_connection = false;
+                } else if (completion.download_chunk.bytes.empty()) {
+                    keep_connection = false;
+                } else {
+                    connection.response_buffer =
+                        std::move(completion.download_chunk.bytes);
+                    connection.sent_size = 0;
+                    connection.download_end_of_file =
+                        completion.download_chunk.end_of_file;
+                    connection.state = ConnectionState::download_sending;
+                    keep_connection = modify_client_events(
+                        completion.client_fd,
+                        connection,
+                        EPOLLOUT | EPOLLRDHUP | EPOLLET,
+                        "epoll_ctl resume streaming download");
+                }
+            }
+
+            if (!keep_connection) {
                 close_client(completion.client_fd);
             }
+        }
+        return true;
+    }
+
+    bool modify_client_events(
+        int client_fd,
+        const ClientConnection& connection,
+        std::uint32_t events,
+        const char* error_operation) {
+        epoll_event client_event {};
+        client_event.events = events;
+        client_event.data.u64 = connection.id;
+        if (::epoll_ctl(
+                epoll_fd_,
+                EPOLL_CTL_MOD,
+                client_fd,
+                &client_event) == -1) {
+            std::perror(error_operation);
+            return false;
         }
         return true;
     }
@@ -908,19 +1548,11 @@ private:
         // 当前服务器每个连接只处理一个请求，响应完成后关闭连接。
         connection.request_buffer.clear();
 
-        epoll_event client_event {};
-        client_event.events = EPOLLOUT | EPOLLRDHUP | EPOLLET;
-        client_event.data.u64 = connection.id;
-        if (::epoll_ctl(
-                epoll_fd_,
-                EPOLL_CTL_MOD,
-                client_fd,
-                &client_event) == -1) {
-            std::perror("epoll_ctl modify client Socket");
-            return false;
-        }
-
-        return true;
+        return modify_client_events(
+            client_fd,
+            connection,
+            EPOLLOUT | EPOLLRDHUP | EPOLLET,
+            "epoll_ctl modify client Socket");
     }
 
     static bool header_is_too_large(const std::string& request_buffer) {
@@ -949,9 +1581,15 @@ private:
                 continue;
             }
 
-            if (connection.state == ConnectionState::receiving) {
+            if (connection.state == ConnectionState::receiving ||
+                connection.state == ConnectionState::upload_receiving) {
                 receiving_timeouts.push_back(client_fd);
-            } else if (connection.state == ConnectionState::processing) {
+            } else if (
+                connection.state == ConnectionState::processing ||
+                connection.state == ConnectionState::upload_preparing ||
+                connection.state == ConnectionState::upload_writing ||
+                connection.state == ConnectionState::download_preparing ||
+                connection.state == ConnectionState::download_reading) {
                 processing_timeouts.push_back(client_fd);
             } else {
                 sending_timeouts.push_back(client_fd);

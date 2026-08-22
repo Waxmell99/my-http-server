@@ -2,11 +2,13 @@
 
 #include "http/http_request.h"
 #include "http/http_response.h"
+#include "storage/database.h"
 
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -20,6 +22,8 @@ public:
     AuthService& operator=(const AuthService&) = delete;
 
     HttpResponse handle_request(const HttpRequest& request);
+    [[nodiscard]] std::optional<SessionUser> authenticate_request(
+        const HttpRequest& request) const;
 
 private:
     struct FailureState {

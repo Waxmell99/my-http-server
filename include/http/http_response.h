@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -30,5 +31,8 @@ struct HttpResponse {
 
 // 将响应对象序列化为符合 HTTP/1.1 格式的字符串。
 std::string serialize_http_response(const HttpResponse& response);
+std::string serialize_http_response_head(
+    const HttpResponse& response,
+    std::uint64_t content_length);
 
 }  // namespace personal_cloud

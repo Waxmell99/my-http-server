@@ -349,6 +349,17 @@ AuthService::AuthService(std::filesystem::path database_path)
     dummy_password_hash_ = hash_password("dummy-password-for-timing-only");
 }
 
+std::optional<SessionUser> AuthService::authenticate_request(
+    const HttpRequest& request) const {
+    const std::optional<std::string> token = session_token_from_cookie(request);
+    if (!token.has_value()) {
+        return std::nullopt;
+    }
+    Database database(database_path_, DatabaseOpenMode::existing_schema);
+    return database.find_session_user(
+        hash_session_token(*token), unix_time_now());
+}
+
 HttpResponse AuthService::handle_request(const HttpRequest& request) {
     std::optional<std::string> active_login_attempt;
     try {
@@ -460,21 +471,8 @@ HttpResponse AuthService::handle_request(const HttpRequest& request) {
             if (request.method != "GET") {
                 return method_not_allowed("GET");
             }
-            const std::optional<std::string> token =
-                session_token_from_cookie(request);
-            if (!token.has_value()) {
-                return json_error(
-                    401,
-                    "Unauthorized",
-                    "authentication_required",
-                    "Authentication required");
-            }
-
-            Database database(
-                database_path_, DatabaseOpenMode::existing_schema);
             const std::optional<SessionUser> user =
-                database.find_session_user(
-                    hash_session_token(*token), unix_time_now());
+                authenticate_request(request);
             if (!user.has_value()) {
                 return json_error(
                     401,

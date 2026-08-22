@@ -3,13 +3,14 @@
 这是一个用于学习 Linux 网络编程和 HTTP 的 C++ 项目。
 
 当前进度：已经完成非阻塞 Socket、epoll 事件循环、HTTP Request/Response、
-路由、超时清理、优雅停机、SQLite 持久化、异步任务桥、用户/Session 认证和
-端到端测试。
+路由、超时清理、优雅停机、SQLite 持久化、异步任务桥、用户/Session 认证、
+流式文件上传/下载、文件管理和端到端测试。
 服务器使用单线程 epoll 管理大量连接，不会让一个慢客户端阻塞其他客户端。
 请求解析器支持
 Header、`Content-Length`
 和 Body，并严格检查 HTTP/1.x 请求行、Host、Header 控制字符和消息长度。
-服务器可以处理 GET、认证 JSON API，以及在内存中接收简单的 `text/plain` POST。
+服务器可以处理 GET、认证/文件 JSON API、普通小 Body 请求，以及不进入普通
+Body 缓冲的大文件上传和下载。
 
 ## 当前结构
 
@@ -21,7 +22,7 @@ Header、`Content-Length`
 ├── README.md       # 当前进度和学习任务
 ├── guide.md        # 项目整体规划
 ├── include/
-│   ├── app/         # 后端配置、认证服务和应用层请求入口
+│   ├── app/         # 后端配置、认证/文件服务和应用层请求入口
 │   ├── concurrency/
 │   │   └── thread_pool.h   # 有界线程池接口
 │   ├── http/
@@ -31,6 +32,7 @@ Header、`Content-Length`
 │   ├── server/
 │   │   ├── client_handler.h # 旧阻塞模型的单客户端处理接口（学习对照）
 │   │   ├── epoll_server.h   # epoll 服务器配置和启动接口
+│   │   ├── streaming.h      # worker 与 epoll 间的流式文件接口
 │   │   └── http_server.h    # Socket 基础操作接口
 │   └── storage/
 │       └── database.h       # SQLite 生命周期和迁移接口
@@ -38,6 +40,7 @@ Header、`Content-Length`
 │   ├── backend_application.cpp # 应用路由和 JSON 状态接口
 │   ├── backend_config.cpp   # 命令行配置解析
 │   ├── auth_service.cpp     # 注册、登录、Session 和限速
+│   ├── file_service.cpp     # 文件元数据、上传、下载、重命名和删除
 │   ├── client_handler.cpp  # 旧阻塞式客户端处理流程（学习对照）
 │   ├── database.cpp        # SQLite 配置和版本化迁移
 │   ├── epoll_server.cpp    # 非阻塞收发、连接状态和 epoll 事件循环
@@ -98,13 +101,17 @@ ctest --test-dir build --output-on-failure
     --max-connections 10000 \
     --idle-timeout 30 \
     --worker-count 4 \
-    --task-queue-size 256
+    --task-queue-size 256 \
+    --max-file-size 1073741824 \
+    --user-quota 10737418240 \
+    --max-concurrent-uploads 4 \
+    --stream-buffer-size 65536
 ```
 
 使用 `./build/http_server --help` 可以查看全部选项。非法配置会在创建监听
 Socket 前被拒绝。首次启动时会自动创建数据库目录、文件存储目录和 Schema；
-当前第一版迁移包含 `users`、`sessions`、`files` 及必要索引。SQLite 会启用
-外键、WAL 和 5 秒 busy timeout。
+当前第一版迁移包含 `users`、`sessions`、`files` 及必要索引。存储根下会创建
+`objects/`、`tmp/` 和 `trash/`。SQLite 会启用外键、WAL 和 5 秒 busy timeout。
 
 可能访问数据库或文件系统的请求通过有界应用工作线程池执行。等待队列满时服务
 返回 `503 Service Unavailable`，不会继续无界积累任务。`/health` 等纯内存快速
@@ -179,6 +186,51 @@ Token 使用 32 字节安全随机数，只通过 `Set-Cookie` 发给客户端�
 前置代理，并为 `pc_session` Cookie 添加 `Secure`；例如支持
 `proxy_cookie_flags pc_session secure` 的 Nginx 配置。登录对不存在用户和密码错误
 返回相同响应，并对连续失败进行有界内存限速。
+
+## 文件 API
+
+文件接口使用登录得到的 `pc_session` Cookie。上传 Body 是文件原始字节，展示名称
+通过 `X-File-Name` 传入，`Content-Type` 会保存为文件 MIME：
+
+```bash
+curl -i -b /tmp/personal-cloud-cookie.txt \
+    -H 'X-File-Name: example.pdf' \
+    -H 'Content-Type: application/pdf' \
+    --data-binary @example.pdf \
+    http://127.0.0.1:9000/api/files
+```
+
+响应中的 `id` 是对外文件 ID。列出文件和读取单条元数据：
+
+```bash
+curl -b /tmp/personal-cloud-cookie.txt \
+    http://127.0.0.1:9000/api/files
+
+curl -b /tmp/personal-cloud-cookie.txt \
+    http://127.0.0.1:9000/api/files/FILE_ID
+```
+
+流式下载、修改展示名称和删除：
+
+```bash
+curl -b /tmp/personal-cloud-cookie.txt -o downloaded.bin \
+    http://127.0.0.1:9000/api/files/FILE_ID/content
+
+curl -i -b /tmp/personal-cloud-cookie.txt \
+    -X PATCH -H 'Content-Type: application/json' \
+    --data-binary '{"name":"renamed.pdf"}' \
+    http://127.0.0.1:9000/api/files/FILE_ID
+
+curl -i -b /tmp/personal-cloud-cookie.txt -X DELETE \
+    http://127.0.0.1:9000/api/files/FILE_ID
+```
+
+默认单文件上限为 1 GiB、单用户容量为 10 GiB、全局同时上传数为 4，上传和下载
+块为 64 KiB。上传块写盘期间连接会暂停读取，下载也只在上一块完整发送后读取
+下一块，因此慢磁盘或慢客户端不会造成文件内容在内存中无界累积。上传完成前只写
+`tmp/`，成功后原子发布到 `objects/` 并提交 SQLite 元数据；断连和失败会清理临时
+文件。服务端生成的存储键不会暴露给 API，所有文件查询同时校验当前 Session 和
+所有者。
 
 在另一个终端使用 netcat 连接：
 
@@ -257,12 +309,13 @@ accept 队列，但会立即关闭超出的连接，防止连接状态无界增�
 2. `http_request.h/.cpp` 解析请求行、Header、`Content-Length` 和 Body。
 3. `router.h/.cpp` 根据 method 和 path 选择响应。
 4. `http_response.h/.cpp` 把响应对象序列化为 HTTP 文本。
-5. `epoll_server.h/.cpp` 保存连接的接收、处理和发送状态，调度非阻塞 IO，处理
-   信号停机和描述符耗尽恢复，并通过有界线程池、完成队列和 `eventfd` 调度
-   可能阻塞的应用任务。
+5. `epoll_server.h/.cpp` 保存普通请求以及流式上传/下载的连接状态，调度非阻塞
+   IO，处理信号停机和描述符耗尽恢复，并通过有界线程池、完成队列和 `eventfd`
+   调度可能阻塞的数据库及文件任务。
 6. `backend_config` 解析启动配置；`database` 初始化 SQLite、执行迁移并提供全部
-   绑定参数认证查询；`auth_service` 负责 Argon2id、Session 和失败限速；
-   `backend_application` 把这些操作封装为 worker 任务。
+   绑定参数查询；`auth_service` 负责 Argon2id、Session 和失败限速；
+   `file_service` 负责文件所有权、配额、元数据和磁盘一致性；
+   `backend_application` 把这些操作封装为普通或流式 worker 任务。
 7. `main.cpp` 组装配置、数据库、应用处理器和事件循环。
 8. `thread_pool` 执行异步应用任务；`client_handler` 只作为旧阻塞模型的学习
    对照，不参与 `http_server` 可执行程序的构建。
@@ -291,9 +344,9 @@ accept 队列，但会立即关闭超出的连接，防止连接状态无界增�
 - 为什么 `EMFILE` 时需要保留 fd、暂停监听和显式重新启用 one-shot 事件。
 - 为什么用 `signalfd` 可以让信号处理保持在普通同步代码中。
 
-后端后续顺序和各阶段验收标准见 `BACKEND_PLAN.md`。认证闭环已经完成，下一步是
-阶段 4 的文件元数据和流式上传。上传不能复用当前 64 KiB 普通请求 Body 路径，
-需要单独设计临时文件、增量哈希和读取背压状态。
+后端后续顺序和各阶段验收标准见 `BACKEND_PLAN.md`。用户与文件最小闭环（阶段
+1–5）已经完成，下一步是阶段 6 的前端真实 API 接入、请求 ID/结构化日志、启动
+临时文件清扫和数据库/磁盘一致性检查、备份与可重复压力测试。
 
 ## 学习约定
 

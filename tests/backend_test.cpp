@@ -2,6 +2,7 @@
 #include "app/backend_config.h"
 #include "storage/database.h"
 
+#include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
 #include <cerrno>
@@ -222,6 +223,14 @@ void test_configuration() {
         "7",
         "--task-queue-size",
         "99",
+        "--max-file-size",
+        "1000000",
+        "--user-quota",
+        "2000000",
+        "--max-concurrent-uploads",
+        "3",
+        "--stream-buffer-size",
+        "32768",
         "--verbose",
     });
     expect(result.config.has_value(), "parse all supported backend options");
@@ -236,6 +245,12 @@ void test_configuration() {
                "parse the configured application worker count");
         expect(result.config->server.application_queue_size == 99,
                "parse the configured application task queue size");
+        expect(result.config->maximum_file_size == 1000000 &&
+                   result.config->user_quota == 2000000,
+               "parse file size and user quota limits");
+        expect(result.config->maximum_concurrent_uploads == 3 &&
+                   result.config->server.streaming_chunk_size == 32768,
+               "parse upload concurrency and stream buffer limits");
         expect(result.config->server.verbose_logging,
                "parse verbose logging flag");
     }
@@ -252,6 +267,11 @@ void test_configuration() {
            "reject a zero application worker count");
     expect(!parse({"--task-queue-size", "-1"}).config.has_value(),
            "reject a negative application task queue size");
+    expect(!parse({"--max-file-size", "20", "--user-quota", "10"})
+                .config.has_value(),
+           "reject a file limit above the user quota");
+    expect(!parse({"--stream-buffer-size", "5000000"}).config.has_value(),
+           "reject an excessively large stream buffer");
     expect(!parse({"--unknown"}).config.has_value(),
            "reject an unknown option");
     expect(parse({"--help"}).show_help, "recognize the help option");
@@ -662,6 +682,303 @@ void test_authentication_with_shared_memory_database() {
            "share an in-memory database with worker connections");
 }
 
+std::string register_and_login(
+    personal_cloud::BackendApplication& application,
+    std::string_view username,
+    std::string_view password) {
+    const std::string credentials =
+        "{\"username\":\"" + std::string(username) +
+        "\",\"password\":\"" + std::string(password) + "\"}";
+    const personal_cloud::HttpResponse registration = run_application_task(
+        application, json_request("/api/auth/register", credentials));
+    if (registration.status_code != 201) {
+        throw std::runtime_error("Cannot register file test user");
+    }
+    const personal_cloud::HttpResponse login = run_application_task(
+        application, json_request("/api/auth/login", credentials));
+    const std::string cookie = cookie_pair(login);
+    if (login.status_code != 200 || cookie.empty()) {
+        throw std::runtime_error("Cannot log in file test user");
+    }
+    return cookie;
+}
+
+personal_cloud::HttpRequest upload_request(
+    std::string cookie,
+    std::string name = "large.bin") {
+    return {
+        "POST",
+        "/api/files",
+        "HTTP/1.1",
+        {{"cookie", std::move(cookie)},
+         {"x-file-name", std::move(name)},
+         {"content-type", "application/octet-stream"}},
+        {},
+    };
+}
+
+personal_cloud::HttpResponse finish_direct_upload(
+    personal_cloud::BackendApplication& application,
+    const personal_cloud::HttpRequest& request,
+    const std::string& content,
+    std::size_t chunk_size) {
+    std::optional<personal_cloud::UploadPreparationTask> task =
+        application.make_upload_task(request, content.size());
+    if (!task.has_value()) {
+        throw std::runtime_error("Expected upload preparation task");
+    }
+    personal_cloud::UploadPreparationResult preparation = (*task)();
+    if (std::holds_alternative<personal_cloud::HttpResponse>(preparation)) {
+        return std::get<personal_cloud::HttpResponse>(std::move(preparation));
+    }
+    std::shared_ptr<personal_cloud::UploadStream> stream =
+        std::get<std::shared_ptr<personal_cloud::UploadStream>>(
+            std::move(preparation));
+    std::optional<personal_cloud::HttpResponse> response;
+    std::size_t offset = 0;
+    while (offset < content.size()) {
+        const std::size_t size =
+            std::min(chunk_size, content.size() - offset);
+        const bool final = offset + size == content.size();
+        response = stream->append(
+            std::string_view(content).substr(offset, size), final);
+        offset += size;
+    }
+    if (content.empty()) {
+        response = stream->append({}, true);
+    }
+    if (!response.has_value()) {
+        throw std::runtime_error("Upload did not produce a final response");
+    }
+    return std::move(*response);
+}
+
+void test_file_lifecycle_limits_and_isolation() {
+    TemporaryDirectory temporary;
+    const std::filesystem::path database_path = temporary.path() / "cloud.db";
+    personal_cloud::BackendConfig config;
+    config.database_path = database_path;
+    config.storage_root = temporary.path() / "storage";
+    config.maximum_file_size = 90 * 1024;
+    config.user_quota = 100 * 1024;
+    config.maximum_concurrent_uploads = 1;
+
+    std::string owner_cookie;
+    std::string other_cookie;
+    std::string file_id;
+    std::string original_storage_key;
+    const std::string content(70 * 1024, 'x');
+    {
+        personal_cloud::BackendApplication application(config);
+        owner_cookie = register_and_login(
+            application, "FileOwner", "owner-password");
+        other_cookie = register_and_login(
+            application, "OtherUser", "other-password");
+
+        std::optional<personal_cloud::UploadPreparationTask> unauthorized_task =
+            application.make_upload_task(upload_request({}), 1);
+        personal_cloud::UploadPreparationResult unauthorized_preparation =
+            (*unauthorized_task)();
+        expect(
+            std::holds_alternative<personal_cloud::HttpResponse>(
+                unauthorized_preparation) &&
+                std::get<personal_cloud::HttpResponse>(
+                    unauthorized_preparation)
+                        .status_code == 401,
+            "authenticate before creating an upload temporary file");
+
+        std::optional<personal_cloud::UploadPreparationTask> oversized_task =
+            application.make_upload_task(
+                upload_request(owner_cookie, "oversized.bin"),
+                config.maximum_file_size + 1);
+        personal_cloud::UploadPreparationResult oversized_preparation =
+            (*oversized_task)();
+        expect(
+            std::holds_alternative<personal_cloud::HttpResponse>(
+                oversized_preparation) &&
+                std::get<personal_cloud::HttpResponse>(oversized_preparation)
+                        .status_code == 413,
+            "reject an oversized upload before reading its body");
+
+        const personal_cloud::HttpRequest interrupted_request =
+            upload_request(owner_cookie, "interrupted.bin");
+        std::optional<personal_cloud::UploadPreparationTask> interrupted_task =
+            application.make_upload_task(interrupted_request, 4096);
+        personal_cloud::UploadPreparationResult interrupted_preparation =
+            (*interrupted_task)();
+        std::shared_ptr<personal_cloud::UploadStream> interrupted_stream =
+            std::get<std::shared_ptr<personal_cloud::UploadStream>>(
+                std::move(interrupted_preparation));
+        expect(!interrupted_stream->append("partial", false).has_value(),
+               "keep an interrupted upload uncommitted");
+
+        std::optional<personal_cloud::UploadPreparationTask> limited_task =
+            application.make_upload_task(
+                upload_request(owner_cookie, "second.bin"), 1024);
+        personal_cloud::UploadPreparationResult limited_preparation =
+            (*limited_task)();
+        expect(
+            std::holds_alternative<personal_cloud::HttpResponse>(
+                limited_preparation) &&
+                std::get<personal_cloud::HttpResponse>(limited_preparation)
+                        .status_code == 503,
+            "enforce the global concurrent upload limit");
+        interrupted_stream.reset();
+
+        const personal_cloud::HttpResponse uploaded = finish_direct_upload(
+            application,
+            upload_request(owner_cookie),
+            content,
+            4096);
+        expect(uploaded.status_code == 201,
+               "stream a file through bounded application chunks");
+        const nlohmann::json upload_json =
+            nlohmann::json::parse(uploaded.body);
+        file_id = upload_json["file"]["id"].get<std::string>();
+        expect(upload_json["file"]["size"] == content.size() &&
+                   upload_json["file"]["sha256"]
+                           .get<std::string>()
+                           .size() == 64,
+               "return persisted size and SHA-256 metadata");
+
+        const personal_cloud::HttpResponse quota_response =
+            finish_direct_upload(
+                application,
+                upload_request(owner_cookie, "quota.bin"),
+                std::string(40 * 1024, 'q'),
+                4096);
+        expect(quota_response.status_code == 413 &&
+                   quota_response.body.find("quota_exceeded") !=
+                       std::string::npos,
+               "account for committed bytes when enforcing user quota");
+
+        personal_cloud::HttpResponse response = run_application_task(
+            application,
+            {"GET",
+             "/api/files",
+             "HTTP/1.1",
+             {{"cookie", owner_cookie}},
+             {}});
+        expect(response.status_code == 200 &&
+                   response.body.find(file_id) != std::string::npos,
+               "list only the authenticated user's file metadata");
+
+        response = run_application_task(
+            application,
+            {"GET",
+             "/api/files",
+             "HTTP/1.1",
+             {{"cookie", other_cookie}},
+             {}});
+        expect(response.status_code == 200 &&
+                   response.body.find(file_id) == std::string::npos,
+               "hide another user's files from list results");
+
+        response = run_application_task(
+            application,
+            {"GET",
+             "/api/files/" + file_id,
+             "HTTP/1.1",
+             {{"cookie", other_cookie}},
+             {}});
+        expect(response.status_code == 404,
+               "hide another user's file metadata behind 404");
+
+        response = run_application_task(
+            application,
+            {"DELETE",
+             "/api/files/" + file_id,
+             "HTTP/1.1",
+             {{"cookie", other_cookie}},
+             {}});
+        expect(response.status_code == 404,
+               "prevent another user from deleting a guessed file ID");
+
+        {
+            RawDatabase raw(database_path);
+            original_storage_key = raw.scalar_text(
+                "SELECT storage_key FROM files LIMIT 1;");
+            expect(raw.scalar_int("SELECT COUNT(*) FROM files;") == 1,
+                   "leave no metadata row for interrupted uploads");
+        }
+        expect(std::filesystem::is_empty(config.storage_root / "tmp"),
+               "remove interrupted upload temporary files");
+
+        response = run_application_task(
+            application,
+            {"PATCH",
+             "/api/files/" + file_id,
+             "HTTP/1.1",
+             {{"cookie", owner_cookie},
+              {"content-type", "application/json"}},
+             "{\"name\":\"renamed.bin\"}"});
+        expect(response.status_code == 200 &&
+                   response.body.find("renamed.bin") != std::string::npos,
+               "rename only the display name");
+        {
+            RawDatabase raw(database_path);
+            expect(raw.scalar_text(
+                       "SELECT storage_key FROM files LIMIT 1;") ==
+                       original_storage_key,
+                   "keep the internal storage key stable when renaming");
+        }
+
+        std::optional<personal_cloud::DownloadPreparationTask> denied_task =
+            application.make_download_task(
+                {"GET",
+                 "/api/files/" + file_id + "/content",
+                 "HTTP/1.1",
+                 {{"cookie", other_cookie}},
+                 {}});
+        personal_cloud::DownloadPreparationResult denied = (*denied_task)();
+        expect(std::holds_alternative<personal_cloud::HttpResponse>(denied) &&
+                   std::get<personal_cloud::HttpResponse>(denied).status_code ==
+                       404,
+               "deny cross-user content downloads");
+    }
+
+    {
+        personal_cloud::BackendApplication reopened(config);
+        std::optional<personal_cloud::DownloadPreparationTask> task =
+            reopened.make_download_task(
+                {"GET",
+                 "/api/files/" + file_id + "/content",
+                 "HTTP/1.1",
+                 {{"cookie", owner_cookie}},
+                 {}});
+        personal_cloud::DownloadPreparationResult preparation = (*task)();
+        std::shared_ptr<personal_cloud::DownloadStream> stream =
+            std::get<std::shared_ptr<personal_cloud::DownloadStream>>(
+                std::move(preparation));
+        std::string downloaded;
+        while (true) {
+            personal_cloud::DownloadChunk chunk = stream->read_chunk(3072);
+            downloaded += chunk.bytes;
+            if (chunk.end_of_file) {
+                break;
+            }
+        }
+        expect(downloaded == content,
+               "stream exact file content after application restart");
+
+        const personal_cloud::HttpResponse deleted = run_application_task(
+            reopened,
+            {"DELETE",
+             "/api/files/" + file_id,
+             "HTTP/1.1",
+             {{"cookie", owner_cookie}},
+             {}});
+        expect(deleted.status_code == 200,
+               "delete owned file metadata and disk content");
+        expect(!std::filesystem::exists(
+                   config.storage_root / "objects" / original_storage_key),
+               "remove the permanent object after deletion");
+        RawDatabase raw(database_path);
+        expect(raw.scalar_int("SELECT COUNT(*) FROM files;") == 0,
+               "remove deleted file metadata from SQLite");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -672,6 +989,7 @@ int main() {
         test_rejects_incomplete_schema();
         test_authentication_lifecycle_and_security();
         test_authentication_with_shared_memory_database();
+        test_file_lifecycle_limits_and_isolation();
     } catch (const std::exception& error) {
         std::cerr << "Unexpected backend test exception: "
                   << error.what() << '\n';

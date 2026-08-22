@@ -4,6 +4,8 @@
 #include "http/router.h"
 #include "server/http_server.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -242,6 +244,13 @@ bool has_status(const ExchangeResult& result, std::string_view status) {
     return result.succeeded && result.response.starts_with(status);
 }
 
+std::string_view response_body(std::string_view response) {
+    const std::size_t separator = response.find("\r\n\r\n");
+    return separator == std::string_view::npos
+               ? std::string_view{}
+               : response.substr(separator + 4);
+}
+
 class RunningServer final {
 public:
     explicit RunningServer(
@@ -252,7 +261,10 @@ public:
         personal_cloud::ApplicationTaskFactory request_task_factory = {},
         std::size_t worker_count = 4,
         std::size_t task_queue_size = 256,
-        std::chrono::seconds idle_timeout = 1s)
+        std::chrono::seconds idle_timeout = 1s,
+        personal_cloud::UploadTaskFactory upload_task_factory = {},
+        personal_cloud::DownloadTaskFactory download_task_factory = {},
+        std::size_t streaming_chunk_size = 64 * 1024)
         : port_(find_available_port()) {
         if (port_ == 0) {
             return;
@@ -266,8 +278,11 @@ public:
         config.handle_termination_signals = handle_termination_signals;
         config.request_handler = std::move(request_handler);
         config.request_task_factory = std::move(request_task_factory);
+        config.upload_task_factory = std::move(upload_task_factory);
+        config.download_task_factory = std::move(download_task_factory);
         config.application_worker_count = worker_count;
         config.application_queue_size = task_queue_size;
+        config.streaming_chunk_size = streaming_chunk_size;
         thread_ = std::jthread([this, config](std::stop_token token) {
             result_.store(
                 personal_cloud::run_epoll_server(config, token),
@@ -946,6 +961,200 @@ void test_live_authentication_api() {
     std::filesystem::remove_all(temporary_path, error);
 }
 
+void test_live_streaming_file_api() {
+    std::string pattern =
+        (std::filesystem::temp_directory_path() /
+         "personal-cloud-files-integration-XXXXXX")
+            .string();
+    pattern.push_back('\0');
+    char* directory = ::mkdtemp(pattern.data());
+    expect(directory != nullptr,
+           "create a temporary directory for streaming file tests");
+    if (directory == nullptr) {
+        return;
+    }
+    const std::filesystem::path temporary_path(directory);
+
+    personal_cloud::BackendConfig config;
+    config.database_path = temporary_path / "files.db";
+    config.storage_root = temporary_path / "storage";
+    config.maximum_file_size = 1024 * 1024;
+    config.user_quota = 2 * 1024 * 1024;
+    personal_cloud::BackendApplication application(config);
+    RunningServer server(
+        true,
+        128,
+        [&application](const personal_cloud::HttpRequest& request) {
+            return application.handle_request(request);
+        },
+        [&application](const personal_cloud::HttpRequest& request) {
+            return application.make_task(request);
+        },
+        4,
+        32,
+        5s,
+        [&application](
+            const personal_cloud::HttpRequest& request,
+            std::uint64_t content_length) {
+            return application.make_upload_task(request, content_length);
+        },
+        [&application](const personal_cloud::HttpRequest& request) {
+            return application.make_download_task(request);
+        },
+        4096);
+    expect(server.started(), "start the real streaming file application");
+    if (!server.started()) {
+        std::error_code error;
+        std::filesystem::remove_all(temporary_path, error);
+        return;
+    }
+
+    ExchangeResult response = json_exchange(
+        server.port(),
+        "/api/auth/register",
+        "{\"username\":\"StreamOwner\","
+        "\"password\":\"stream-owner-password\"}");
+    response = json_exchange(
+        server.port(),
+        "/api/auth/login",
+        "{\"username\":\"StreamOwner\","
+        "\"password\":\"stream-owner-password\"}");
+    const std::string owner_cookie =
+        response_header_value(response, "Set-Cookie")
+            .substr(0, response_header_value(response, "Set-Cookie").find(';'));
+    expect(has_status(response, "HTTP/1.1 200 OK\r\n") &&
+               owner_cookie.starts_with("pc_session="),
+           "log in the streaming file owner");
+
+    response = json_exchange(
+        server.port(),
+        "/api/auth/register",
+        "{\"username\":\"StreamOther\","
+        "\"password\":\"stream-other-password\"}");
+    response = json_exchange(
+        server.port(),
+        "/api/auth/login",
+        "{\"username\":\"StreamOther\","
+        "\"password\":\"stream-other-password\"}");
+    const std::string other_set_cookie =
+        response_header_value(response, "Set-Cookie");
+    const std::string other_cookie =
+        other_set_cookie.substr(0, other_set_cookie.find(';'));
+
+    std::string content;
+    content.reserve(200 * 1024);
+    for (std::size_t index = 0; index < 200 * 1024; ++index) {
+        content += static_cast<char>('a' + index % 23);
+    }
+    std::string upload_head =
+        "POST /api/files HTTP/1.1\r\nHost: localhost\r\nCookie: ";
+    upload_head += owner_cookie;
+    upload_head +=
+        "\r\nX-File-Name: streamed.bin\r\n"
+        "Content-Type: application/octet-stream\r\nContent-Length: ";
+    upload_head += std::to_string(content.size());
+    upload_head += "\r\n\r\n";
+    std::vector<std::string_view> upload_parts;
+    upload_parts.push_back(upload_head);
+    for (std::size_t offset = 0; offset < content.size(); offset += 3072) {
+        upload_parts.push_back(
+            std::string_view(content).substr(offset, 3072));
+    }
+    response = exchange(server.port(), upload_parts);
+    expect(has_status(response, "HTTP/1.1 201 Created\r\n"),
+           "upload a body larger than the ordinary 64 KiB request limit");
+    std::string file_id;
+    if (has_status(response, "HTTP/1.1 201 Created\r\n")) {
+        const nlohmann::json body =
+            nlohmann::json::parse(response_body(response.response));
+        file_id = body["file"]["id"].get<std::string>();
+    }
+
+    std::string metadata_request =
+        "GET /api/files/" + file_id +
+        " HTTP/1.1\r\nHost: localhost\r\nCookie: " + other_cookie +
+        "\r\n\r\n";
+    response = exchange(server.port(), {metadata_request});
+    expect(has_status(response, "HTTP/1.1 404 Not Found\r\n"),
+           "deny another user access to guessed file metadata over HTTP");
+
+    std::string denied_download_request =
+        "GET /api/files/" + file_id +
+        "/content HTTP/1.1\r\nHost: localhost\r\nCookie: " +
+        other_cookie + "\r\n\r\n";
+    response = exchange(server.port(), {denied_download_request});
+    expect(has_status(response, "HTTP/1.1 404 Not Found\r\n"),
+           "deny another user access to guessed file content over HTTP");
+
+    std::string download_request =
+        "GET /api/files/" + file_id +
+        "/content HTTP/1.1\r\nHost: localhost\r\nCookie: " +
+        owner_cookie + "\r\n\r\n";
+    response = exchange(server.port(), {download_request});
+    expect(has_status(response, "HTTP/1.1 200 OK\r\n") &&
+               response_body(response.response) == content,
+           "download exact large content through bounded worker reads");
+
+    std::string rename_request =
+        "PATCH /api/files/" + file_id +
+        " HTTP/1.1\r\nHost: localhost\r\nCookie: " + owner_cookie +
+        "\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n"
+        "{\"name\":\"renamed-live.bin\"}";
+    response = exchange(server.port(), {rename_request});
+    expect(has_status(response, "HTTP/1.1 200 OK\r\n") &&
+               response.response.find("renamed-live.bin") !=
+                   std::string::npos,
+           "rename an owned file over real HTTP");
+
+    {
+        FileDescriptor interrupted = connect_to_server(server.port());
+        std::string interrupted_request =
+            "POST /api/files HTTP/1.1\r\nHost: localhost\r\nCookie: " +
+            owner_cookie +
+            "\r\nX-File-Name: interrupted-live.bin\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: 50000\r\n\r\npartial";
+        expect(interrupted && send_bytes(interrupted.get(), interrupted_request),
+               "start an upload that will disconnect early");
+    }
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + 2s;
+    bool temporary_files_cleaned = false;
+    while (std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::error_code error;
+        temporary_files_cleaned =
+            std::filesystem::is_empty(config.storage_root / "tmp", error) &&
+            !error;
+        if (temporary_files_cleaned) {
+            break;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+    expect(temporary_files_cleaned,
+           "clean a real interrupted upload temporary file");
+
+    std::string list_request =
+        "GET /api/files HTTP/1.1\r\nHost: localhost\r\nCookie: " +
+        owner_cookie + "\r\n\r\n";
+    response = exchange(server.port(), {list_request});
+    expect(has_status(response, "HTTP/1.1 200 OK\r\n") &&
+               response.response.find("interrupted-live.bin") ==
+                   std::string::npos,
+           "leave no metadata for a real interrupted upload");
+
+    std::string delete_request =
+        "DELETE /api/files/" + file_id +
+        " HTTP/1.1\r\nHost: localhost\r\nCookie: " + owner_cookie +
+        "\r\n\r\n";
+    response = exchange(server.port(), {delete_request});
+    expect(has_status(response, "HTTP/1.1 200 OK\r\n"),
+           "delete an owned file over real HTTP");
+
+    expect(server.stop_with_signal() == 0,
+           "stop normally after the streaming file flow");
+    std::error_code error;
+    std::filesystem::remove_all(temporary_path, error);
+}
+
 }  // namespace
 
 int main() {
@@ -1027,6 +1236,7 @@ int main() {
     test_full_application_queue_returns_503();
     test_stale_task_completion_is_discarded();
     test_live_authentication_api();
+    test_live_streaming_file_api();
 
     if (failure_count != 0) {
         std::cerr << failure_count << " integration assertion(s) failed.\n";

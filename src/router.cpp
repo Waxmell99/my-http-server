@@ -104,6 +104,35 @@ HttpResponse route_request(const HttpRequest& request) {
 
     }
 
+    if (path == "/app") {
+        if (request.method != "GET") {
+            return {
+                405,
+                "Method Not Allowed",
+                "text/plain; charset=utf-8",
+                "Method Not Allowed\n",
+                {{"Allow", "GET"}},
+            };
+        }
+
+        const auto html = read_file("public/app.html");
+        if (!html.has_value()) {
+            return {
+                500,
+                "Internal Server Error",
+                "text/plain; charset=utf-8",
+                "Cannot open public/app.html\n",
+            };
+        }
+
+        return {
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+            *html,
+        };
+    }
+
     if (path == "/turntable") {
         if (request.method != "GET") {
             return {

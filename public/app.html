@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>☁️ 个人云控制台</title>
+    <style>
+        /* ===== 全局重置 & 主题 ===== */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f1f5f9;
+            color: #0f172a;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+            background-image: radial-gradient(circle at 20% 40%, rgba(56, 189, 248, 0.08) 0%, transparent 60%);
+        }
+
+        /* ===== 通用卡片 ===== */
+        .card {
+            max-width: 920px;
+            width: 100%;
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.9);
+            border-radius: 2.5rem;
+            padding: 2.5rem 3rem;
+            box-shadow: 0 20px 35px -8px rgba(0, 0, 0, 0.08), 0 10px 15px -6px rgba(0, 0, 0, 0.02);
+        }
+
+        .card.auth-card {
+            max-width: 440px;
+            padding: 2.5rem 2.5rem;
+        }
+
+        /* ===== 头部 ===== */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .logo-area {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            font-size: 2rem;
+            line-height: 1;
+        }
+
+        .logo-text {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(135deg, #0f172a 0%, #0ea5e9 80%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        /* ===== 状态指示器 ===== */
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: #f8fafc;
+            padding: 0.4rem 1.2rem;
+            border-radius: 100px;
+            border: 1px solid #e2e8f0;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: #475569;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #22c55e;
+            box-shadow: 0 0 8px rgba(34, 197, 94, 0.4);
+            transition: all 0.3s ease;
+        }
+
+        .status-dot.offline {
+            background: #ef4444;
+            box-shadow: 0 0 8px rgba(239, 68, 68, 0.4);
+        }
+
+        .status-dot.pinging {
+            background: #eab308;
+            box-shadow: 0 0 8px rgba(234, 179, 8, 0.5);
+            animation: pulse 0.8s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.4); opacity: 0.6; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        /* ===== 用户信息栏 ===== */
+        .user-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            background: #f1f5f9;
+            padding: 0.35rem 1rem 0.35rem 0.8rem;
+            border-radius: 100px;
+            border: 1px solid #e2e8f0;
+            font-size: 0.85rem;
+        }
+
+        .user-avatar {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #0ea5e9;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 0.75rem;
+        }
+
+        .user-name {
+            font-weight: 600;
+            color: #0f172a;
+        }
+
+        /* ===== 欢迎横幅 ===== */
+        .welcome {
+            margin-bottom: 2rem;
+            padding: 1.5rem 2rem;
+            background: #eff6ff;
+            border-left: 4px solid #3b82f6;
+            border-radius: 1.2rem;
+        }
+
+        .welcome h2 {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-bottom: 0.3rem;
+            color: #1e293b;
+        }
+
+        .welcome p {
+            color: #475569;
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+
+        .welcome code {
+            background: #dbeafe;
+            padding: 0.2rem 0.6rem;
+            border-radius: 6px;
+            font-family: "JetBrains Mono", "Fira Code", monospace;
+            font-size: 0.85rem;
+            color: #1e40af;
+            border: 1px solid #bfdbfe;
+        }
+
+        /* ===== 信息网格 ===== */
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.2rem;
+            margin-bottom: 2rem;
+        }
+
+        .info-card {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 1.2rem;
+            padding: 1.2rem 1.5rem;
+            transition: transform 0.15s ease, border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .info-card:hover {
+            border-color: #38bdf8;
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px -10px rgba(56, 189, 248, 0.2);
+        }
+
+        .info-card .label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #64748b;
+            font-weight: 600;
+        }
+
+        .info-card .value {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-top: 0.3rem;
+            color: #0f172a;
+            word-break: break-all;
+        }
+
+        .info-card .sub {
+            font-size: 0.8rem;
+            color: #94a3b8;
+            margin-top: 0.2rem;
+        }
+
+        /* ===== 按钮 ===== */
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.8rem;
+            margin-bottom: 0;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: #f1f5f9;
+            border: 1px solid #e2e8f0;
+            padding: 0.6rem 1.4rem;
+            border-radius: 100px;
+            font-weight: 500;
+            font-size: 0.9rem;
+            color: #334155;
+            text-decoration: none;
+            transition: all 0.2s ease;
+            cursor: pointer;
+            font-family: inherit;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+        }
+
+        .btn:hover {
+            background: #ffffff;
+            border-color: #94a3b8;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.04);
+        }
+
+        .btn-primary {
+            background: #0ea5e9;
+            border-color: #0ea5e9;
+            color: #ffffff;
+            font-weight: 600;
+            box-shadow: 0 4px 10px -4px rgba(14, 165, 233, 0.3);
+        }
+
+        .btn-primary:hover {
+            background: #0284c7;
+            border-color: #0284c7;
+            transform: scale(1.02);
+            box-shadow: 0 8px 25px -8px rgba(14, 165, 233, 0.4);
+        }
+
+        .btn-danger {
+            background: #fee2e2;
+            border-color: #fecaca;
+            color: #dc2626;
+        }
+
+        .btn-danger:hover {
+            background: #fecaca;
+            border-color: #fca5a5;
+        }
+
+        .btn-sm {
+            padding: 0.35rem 1rem;
+            font-size: 0.8rem;
+        }
+
+        /* ===== 页脚 ===== */
+        .footer {
+            margin-top: 2rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.8rem;
+            font-size: 0.8rem;
+            color: #94a3b8;
+        }
+
+        .footer a {
+            color: #64748b;
+            text-decoration: none;
+            border-bottom: 1px dotted transparent;
+            transition: color 0.2s;
+        }
+
+        .footer a:hover {
+            color: #0ea5e9;
+            border-bottom-color: #0ea5e9;
+        }
+
+        /* ===== 认证页面 ===== */
+        .auth-title {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .auth-title h1 {
+            font-size: 1.6rem;
+            font-weight: 700;
+            margin-bottom: 0.4rem;
+        }
+
+        .auth-title p {
+            color: #64748b;
+            font-size: 0.9rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.2rem;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #334155;
+            margin-bottom: 0.4rem;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 0.7rem 1rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 0.8rem;
+            font-size: 0.95rem;
+            font-family: inherit;
+            background: #f8fafc;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            outline: none;
+        }
+
+        .form-group input:focus {
+            border-color: #0ea5e9;
+            box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.15);
+            background: #ffffff;
+        }
+
+        .form-group .hint {
+            font-size: 0.75rem;
+            color: #94a3b8;
+            margin-top: 0.3rem;
+        }
+
+        .form-error {
+            color: #dc2626;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+            padding: 0.6rem 1rem;
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            border-radius: 0.8rem;
+            display: none;
+        }
+
+        .form-error.show {
+            display: block;
+        }
+
+        .form-success {
+            color: #16a34a;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+            padding: 0.6rem 1rem;
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            border-radius: 0.8rem;
+            display: none;
+        }
+
+        .form-success.show {
+            display: block;
+        }
+
+        .btn-block {
+            width: 100%;
+            justify-content: center;
+            padding: 0.8rem;
+            font-size: 1rem;
+        }
+
+        .auth-toggle {
+            text-align: center;
+            margin-top: 1.5rem;
+            font-size: 0.9rem;
+            color: #64748b;
+        }
+
+        .auth-toggle a {
+            color: #0ea5e9;
+            text-decoration: none;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .auth-toggle a:hover {
+            color: #0284c7;
+            text-decoration: underline;
+        }
+
+        /* ===== 隐藏 ===== */
+        .hidden {
+            display: none !important;
+        }
+
+        /* ===== Toast 消息 ===== */
+        .toast-container {
+            position: fixed;
+            top: 1.5rem;
+            right: 1.5rem;
+            z-index: 999;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            max-width: 360px;
+        }
+
+        .toast {
+            padding: 0.8rem 1.2rem;
+            border-radius: 1rem;
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            animation: slideIn 0.3s ease;
+        }
+
+        .toast.error {
+            border-left: 4px solid #ef4444;
+        }
+
+        .toast.success {
+            border-left: 4px solid #22c55e;
+        }
+
+        .toast.info {
+            border-left: 4px solid #3b82f6;
+        }
+
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        /* ===== 响应式 ===== */
+        @media (max-width: 640px) {
+            .card {
+                padding: 1.5rem;
+                border-radius: 1.5rem;
+            }
+            .card.auth-card {
+                padding: 2rem 1.5rem;
+            }
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .header-right {
+                width: 100%;
+                justify-content: space-between;
+            }
+            .logo-text { font-size: 1.3rem; }
+            .welcome { padding: 1rem 1.2rem; }
+            .welcome h2 { font-size: 1.1rem; }
+            .info-grid { grid-template-columns: 1fr 1fr; }
+            .footer { flex-direction: column; align-items: flex-start; }
+        }
+
+        @media (max-width: 480px) {
+            .info-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- ===== Toast 容器 ===== -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- ===== 认证页面 ===== -->
+<div class="card auth-card" id="authPage">
+    <div class="auth-title">
+        <div style="font-size:2.5rem; margin-bottom:0.5rem;">☁️</div>
+        <h1 id="authTitle">登录</h1>
+        <p id="authSubtitle">登录到个人云服务器</p>
+    </div>
+
+    <div class="form-error" id="authError"></div>
+    <div class="form-success" id="authSuccess"></div>
+
+    <form id="authForm" autocomplete="on">
+        <div class="form-group">
+            <label for="username">用户名</label>
+            <input type="text" id="username" name="username"
+                   placeholder="输入用户名" required autocomplete="username"
+                   minlength="3" maxlength="64">
+            <div class="hint">3-64 个字符，支持字母、数字、下划线、连字符和点号</div>
+        </div>
+
+        <div class="form-group">
+            <label for="password">密码</label>
+            <input type="password" id="password" name="password"
+                   placeholder="输入密码" required autocomplete="current-password"
+                   minlength="8" maxlength="1024">
+            <div class="hint" id="passwordHint">至少 8 个字符</div>
+        </div>
+
+        <button type="submit" class="btn btn-primary btn-block" id="authSubmit">
+            登录
+        </button>
+    </form>
+
+    <div class="auth-toggle">
+        <span id="authToggleText">还没有账号？</span>
+        <a id="authToggleLink">注册新账号</a>
+    </div>
+</div>
+
+<!-- ===== 主仪表盘 ===== -->
+<div class="card hidden" id="dashboardPage">
+    <!-- 头部 -->
+    <div class="header">
+        <div class="logo-area">
+            <span class="logo-icon">☁️</span>
+            <span class="logo-text">个人云</span>
+        </div>
+        <div class="header-right">
+            <div class="status-badge">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">检测中...</span>
+                <span style="opacity:0.4;margin:0 4px;">|</span>
+                <span id="latencyText">-- ms</span>
+            </div>
+            <div class="user-bar" id="userBar">
+                <span class="user-avatar" id="userAvatar">U</span>
+                <span class="user-name" id="userName">用户</span>
+                <button class="btn btn-sm btn-danger" id="logoutBtn" title="退出登录">退出</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 欢迎横幅 -->
+    <div class="welcome" id="welcomeBanner">
+        <h2 id="welcomeTitle">✅ 服务器运行正常</h2>
+        <p id="welcomeText">
+            HTTP 服务已就绪 · 基于 C++20 + epoll ET 模型 ·
+            健康检查 <code>/health</code>
+        </p>
+    </div>
+
+    <!-- 信息卡片 -->
+    <div class="info-grid">
+        <div class="info-card">
+            <div class="label">📡 监听地址</div>
+            <div class="value" id="serverAddress">--</div>
+            <div class="sub">从当前页面自动获取</div>
+        </div>
+        <div class="info-card">
+            <div class="label">⏱️ 运行时长</div>
+            <div class="value" id="uptime">--</div>
+            <div class="sub">页面打开后计时</div>
+        </div>
+        <div class="info-card">
+            <div class="label">🗄️ 数据库模式</div>
+            <div class="value" id="schemaVersion">--</div>
+            <div class="sub">SQLite 模式版本</div>
+        </div>
+        <div class="info-card">
+            <div class="label">👤 用户 ID</div>
+            <div class="value" id="userId">--</div>
+            <div class="sub">注册时间 <span id="userCreatedAt">--</span></div>
+        </div>
+    </div>
+
+    <!-- 快捷操作 -->
+    <div class="actions">
+        <a href="/" class="btn btn-primary">📂 经典仪表盘</a>
+        <a href="/turntable" class="btn">🎯 转盘页面</a>
+        <span class="btn" onclick="checkHealth()">🔄 刷新状态</span>
+        <span class="btn" onclick="refreshUserInfo()">👤 刷新用户</span>
+    </div>
+
+    <!-- 页脚 -->
+    <div class="footer">
+        <span>☁️ 个人云服务器 · C++ 实现</span>
+        <span>
+            v<span id="appVersion">0.1.0</span> ·
+            <a href="#" onclick="event.preventDefault(); showAbout();">关于</a>
+        </span>
+    </div>
+</div>
+
+<script>
+(function () {
+    "use strict";
+
+    /* ===== 状态 ===== */
+    let isLoginMode = true;
+    let currentUser = null;
+
+    /* ===== DOM 引用 ===== */
+    const authPage = document.getElementById('authPage');
+    const dashboardPage = document.getElementById('dashboardPage');
+    const authForm = document.getElementById('authForm');
+    const authTitle = document.getElementById('authTitle');
+    const authSubtitle = document.getElementById('authSubtitle');
+    const authSubmit = document.getElementById('authSubmit');
+    const authError = document.getElementById('authError');
+    const authSuccess = document.getElementById('authSuccess');
+    const authToggleText = document.getElementById('authToggleText');
+    const authToggleLink = document.getElementById('authToggleLink');
+    const passwordHint = document.getElementById('passwordHint');
+    const logoutBtn = document.getElementById('logoutBtn');
+
+    /* ===== Toast ===== */
+    function showToast(message, type) {
+        const container = document.getElementById('toastContainer');
+        const toast = document.createElement('div');
+        toast.className = 'toast ' + type;
+        const icons = { error: '❌', success: '✅', info: 'ℹ️' };
+        toast.innerHTML = '<span>' + (icons[type] || 'ℹ️') + '</span> ' + message;
+        container.appendChild(toast);
+        setTimeout(function () {
+            toast.style.opacity = '0';
+            toast.style.transition = 'opacity 0.3s';
+            setTimeout(function () { toast.remove(); }, 300);
+        }, 3500);
+    }
+
+    /* ===== API 请求 ===== */
+    async function apiRequest(method, path, body) {
+        const options = {
+            method: method,
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+        };
+        if (body !== undefined) {
+            options.body = JSON.stringify(body);
+        }
+        const resp = await fetch(path, options);
+        const data = await resp.json();
+        return { ok: resp.ok, status: resp.status, data: data };
+    }
+
+    /* ===== 认证切换 ===== */
+    function toggleAuthMode() {
+        isLoginMode = !isLoginMode;
+        if (isLoginMode) {
+            authTitle.textContent = '登录';
+            authSubtitle.textContent = '登录到个人云服务器';
+            authSubmit.textContent = '登录';
+            authToggleText.textContent = '还没有账号？';
+            authToggleLink.textContent = '注册新账号';
+            passwordHint.textContent = '至少 8 个字符';
+        } else {
+            authTitle.textContent = '注册';
+            authSubtitle.textContent = '创建个人云账号';
+            authSubmit.textContent = '注册';
+            authToggleText.textContent = '已有账号？';
+            authToggleLink.textContent = '去登录';
+            passwordHint.textContent = '至少 8 个字符，不要使用重要密码';
+        }
+        authError.classList.remove('show');
+        authSuccess.classList.remove('show');
+    }
+
+    authToggleLink.addEventListener('click', function (e) {
+        e.preventDefault();
+        toggleAuthMode();
+    });
+
+    /* ===== 认证表单提交 ===== */
+    authForm.addEventListener('submit', async function (e) {
+        e.preventDefault();
+        authError.classList.remove('show');
+        authSuccess.classList.remove('show');
+
+        const username = document.getElementById('username').value.trim();
+        const password = document.getElementById('password').value;
+
+        if (!username || !password) {
+            authError.textContent = '请填写用户名和密码';
+            authError.classList.add('show');
+            return;
+        }
+
+        authSubmit.disabled = true;
+        authSubmit.textContent = isLoginMode ? '登录中...' : '注册中...';
+
+        try {
+            const endpoint = isLoginMode ? '/api/auth/login' : '/api/auth/register';
+            const result = await apiRequest('POST', endpoint, { username, password });
+
+            if (result.ok) {
+                const user = result.data.user;
+                currentUser = user;
+                if (isLoginMode) {
+                    showToast('登录成功，欢迎回来 ' + user.username + '！', 'success');
+                } else {
+                    showToast('注册成功！已自动登录', 'success');
+                }
+                showDashboard(user);
+            } else {
+                const errMsg = result.data.error?.message || '操作失败，请重试';
+                authError.textContent = errMsg;
+                authError.classList.add('show');
+            }
+        } catch (err) {
+            authError.textContent = '网络错误：无法连接到服务器';
+            authError.classList.add('show');
+        } finally {
+            authSubmit.disabled = false;
+            authSubmit.textContent = isLoginMode ? '登录' : '注册';
+        }
+    });
+
+    /* ===== 退出登录 ===== */
+    logoutBtn.addEventListener('click', async function () {
+        try {
+            await apiRequest('POST', '/api/auth/logout');
+        } catch (_) { /* ignore */ }
+        currentUser = null;
+        showToast('已退出登录', 'info');
+        showAuthPage();
+    });
+
+    /* ===== 页面切换 ===== */
+    function showAuthPage() {
+        authPage.classList.remove('hidden');
+        dashboardPage.classList.add('hidden');
+        if (!isLoginMode) toggleAuthMode();
+        document.getElementById('username').value = '';
+        document.getElementById('password').value = '';
+        authError.classList.remove('show');
+        authSuccess.classList.remove('show');
+    }
+
+    function showDashboard(user) {
+        authPage.classList.add('hidden');
+        dashboardPage.classList.remove('hidden');
+
+        // 更新用户信息
+        document.getElementById('userName').textContent = user.username;
+        document.getElementById('userAvatar').textContent = user.username.charAt(0).toUpperCase();
+        document.getElementById('userId').textContent = '#' + user.id;
+
+        const createdAt = new Date(user.created_at * 1000);
+        document.getElementById('userCreatedAt').textContent =
+            createdAt.toLocaleDateString('zh-CN', {
+                year: 'numeric', month: 'short', day: 'numeric'
+            });
+
+        // 更新欢迎横幅
+        document.getElementById('welcomeTitle').textContent =
+            '👋 你好，' + user.username + '！';
+        document.getElementById('welcomeText').innerHTML =
+            '你已登录个人云 · 用户 ID <code>#' + user.id + '</code> · ' +
+            '注册于 <code>' + createdAt.toLocaleDateString('zh-CN') + '</code>';
+
+        // 启动定时任务
+        setupDashboard();
+    }
+
+    /* ===== 仪表盘功能 ===== */
+    let healthInterval = null;
+    let uptimeInterval = null;
+
+    function setupDashboard() {
+        // 清理旧定时器
+        if (healthInterval) clearInterval(healthInterval);
+        if (uptimeInterval) clearInterval(uptimeInterval);
+
+        // 地址
+        const url = new URL(window.location.href);
+        document.getElementById('serverAddress').textContent = url.host || '未知';
+
+        // 运行时长
+        const startTime = Date.now();
+        const uptimeEl = document.getElementById('uptime');
+        function updateUptime() {
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            const h = String(Math.floor(elapsed / 3600)).padStart(2, '0');
+            const m = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
+            const s = String(elapsed % 60).padStart(2, '0');
+            uptimeEl.textContent = h + ':' + m + ':' + s;
+        }
+        updateUptime();
+        uptimeInterval = setInterval(updateUptime, 1000);
+
+        // 健康检查
+        checkHealth();
+        healthInterval = setInterval(checkHealth, 15000);
+
+        // 数据库状态
+        fetchStatus();
+    }
+
+    async function checkHealth() {
+        const dot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const latencyText = document.getElementById('latencyText');
+
+        if (!dot || !statusText || !latencyText) return;
+
+        dot.className = 'status-dot pinging';
+        statusText.textContent = '检测中...';
+
+        const start = performance.now();
+        let ok = false;
+        let latency = 0;
+
+        try {
+            const resp = await fetch('/health', {
+                method: 'GET', cache: 'no-store'
+            });
+            latency = Math.round(performance.now() - start);
+            ok = resp.ok;
+        } catch (_) {
+            ok = false;
+            latency = 0;
+        }
+
+        if (ok) {
+            dot.className = 'status-dot';
+            statusText.textContent = '在线';
+            latencyText.textContent = latency + ' ms';
+        } else {
+            dot.className = 'status-dot offline';
+            statusText.textContent = '离线';
+            latencyText.textContent = '-- ms';
+        }
+    }
+
+    async function fetchStatus() {
+        try {
+            const result = await apiRequest('GET', '/api/status');
+            if (result.ok && result.data) {
+                if (result.data.schema_version !== undefined) {
+                    document.getElementById('schemaVersion').textContent =
+                        'v' + result.data.schema_version;
+                }
+                if (result.data.database === 'ok') {
+                    showToast('数据库连接正常', 'info');
+                }
+            }
+        } catch (_) {
+            document.getElementById('schemaVersion').textContent = '未知';
+        }
+    }
+
+    async function refreshUserInfo() {
+        try {
+            const result = await apiRequest('GET', '/api/auth/me');
+            if (result.ok && result.data.user) {
+                currentUser = result.data.user;
+                showDashboard(currentUser);
+                showToast('用户信息已刷新', 'success');
+            } else {
+                showToast('会话已过期，请重新登录', 'error');
+                showAuthPage();
+            }
+        } catch (_) {
+            showToast('无法获取用户信息', 'error');
+        }
+    }
+
+    /* ===== 关于 ===== */
+    function showAbout() {
+        showToast(
+            '☁️ 个人云服务器 v0.1.0 · C++20 + epoll · SQLite + libsodium',
+            'info'
+        );
+    }
+
+    /* ===== 初始化：检查登录状态 ===== */
+    async function init() {
+        try {
+            const result = await apiRequest('GET', '/api/auth/me');
+            if (result.ok && result.data.user) {
+                currentUser = result.data.user;
+                showDashboard(currentUser);
+                return;
+            }
+        } catch (_) { /* 未登录或网络错误，显示登录页 */ }
+        showAuthPage();
+    }
+
+    // 暴露给全局 inline onclick
+    window.checkHealth = checkHealth;
+    window.refreshUserInfo = refreshUserInfo;
+    window.showAbout = showAbout;
+
+    init();
+})();
+</script>
+
+</body>
+</html>

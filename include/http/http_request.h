@@ -27,6 +27,12 @@ struct HttpRequest {
 
 // 解析请求行、Header 和 Content-Length 指定的 Body。
 // 只有返回 complete 时才会填写 request。
+HttpParseResult parse_http_request_head(
+    std::string_view raw_request,
+    HttpRequest& request,
+    std::size_t& content_length,
+    std::size_t& body_offset);
+
 HttpParseResult parse_http_request(
     std::string_view raw_request,
     HttpRequest& request,
