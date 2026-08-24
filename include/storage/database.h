@@ -77,6 +77,7 @@ public:
     void delete_expired_sessions(std::int64_t now);
 
     [[nodiscard]] std::int64_t total_file_size(std::int64_t user_id) const;
+    [[nodiscard]] std::int64_t file_count(std::int64_t user_id) const;
     [[nodiscard]] bool create_file(const StoredFile& file);
     [[nodiscard]] std::vector<StoredFile> list_files(
         std::int64_t user_id,

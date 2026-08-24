@@ -132,6 +132,41 @@ bool valid_file_name(std::string_view name) {
     });
 }
 
+std::optional<std::string> percent_decode(std::string_view value) {
+    const auto hex_value = [](char character) -> int {
+        if (character >= '0' && character <= '9') {
+            return character - '0';
+        }
+        if (character >= 'a' && character <= 'f') {
+            return character - 'a' + 10;
+        }
+        if (character >= 'A' && character <= 'F') {
+            return character - 'A' + 10;
+        }
+        return -1;
+    };
+
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] != '%') {
+            decoded.push_back(value[index]);
+            continue;
+        }
+        if (index + 2 >= value.size()) {
+            return std::nullopt;
+        }
+        const int high = hex_value(value[index + 1]);
+        const int low = hex_value(value[index + 2]);
+        if (high < 0 || low < 0) {
+            return std::nullopt;
+        }
+        decoded.push_back(static_cast<char>((high << 4) | low));
+        index += 2;
+    }
+    return decoded;
+}
+
 bool valid_mime_type(std::string_view mime_type) {
     if (mime_type.empty() || mime_type.size() > maximum_mime_type_size) {
         return false;
@@ -577,8 +612,37 @@ UploadPreparationResult FileService::prepare_upload(
         }
 
         const auto name_header = request.headers.find("x-file-name");
-        if (name_header == request.headers.end() ||
-            !valid_file_name(name_header->second)) {
+        if (name_header == request.headers.end()) {
+            return json_error(
+                422,
+                "Unprocessable Content",
+                "invalid_file_name",
+                "X-File-Name must contain a valid 1-255 byte file name");
+        }
+        std::string original_name = name_header->second;
+        const auto encoding_header =
+            request.headers.find("x-file-name-encoding");
+        if (encoding_header != request.headers.end()) {
+            if (!ascii_case_insensitive_equal(
+                    encoding_header->second, "percent")) {
+                return json_error(
+                    422,
+                    "Unprocessable Content",
+                    "invalid_file_name_encoding",
+                    "X-File-Name-Encoding must be percent when provided");
+            }
+            const std::optional<std::string> decoded =
+                percent_decode(original_name);
+            if (!decoded.has_value()) {
+                return json_error(
+                    422,
+                    "Unprocessable Content",
+                    "invalid_file_name_encoding",
+                    "X-File-Name contains invalid percent encoding");
+            }
+            original_name = *decoded;
+        }
+        if (!valid_file_name(original_name)) {
             return json_error(
                 422,
                 "Unprocessable Content",
@@ -657,7 +721,7 @@ UploadPreparationResult FileService::prepare_upload(
         StoredFile file{
             id,
             user->id,
-            name_header->second,
+            original_name,
             storage_key,
             std::move(mime_type),
             static_cast<std::int64_t>(content_length),
@@ -772,10 +836,23 @@ HttpResponse FileService::handle_request(const HttpRequest& request) {
             Database database(
                 state_->database_path, DatabaseOpenMode::existing_schema);
             Json files = Json::array();
-            for (const StoredFile& file : database.list_files(user->id)) {
+            const std::vector<StoredFile> listed_files =
+                database.list_files(user->id);
+            for (const StoredFile& file : listed_files) {
                 files.push_back(file_json(file));
             }
-            return json_response(200, "OK", {{"files", std::move(files)}});
+            const std::int64_t count = database.file_count(user->id);
+            return json_response(
+                200,
+                "OK",
+                {{"files", std::move(files)},
+                 {"usage",
+                  {{"used_bytes", database.total_file_size(user->id)},
+                   {"quota_bytes", state_->user_quota},
+                   {"file_count", count},
+                   {"returned_count", listed_files.size()},
+                   {"truncated", count > static_cast<std::int64_t>(
+                                            listed_files.size())}}}});
         }
 
         const std::optional<std::string_view> id = metadata_file_id(path);

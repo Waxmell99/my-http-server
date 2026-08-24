@@ -4,7 +4,7 @@
 
 当前进度：已经完成非阻塞 Socket、epoll 事件循环、HTTP Request/Response、
 路由、超时清理、优雅停机、SQLite 持久化、异步任务桥、用户/Session 认证、
-流式文件上传/下载、文件管理和端到端测试。
+流式文件上传/下载、文件管理、亮色 Web 控制台、请求 ID、运维工具和端到端测试。
 服务器使用单线程 epoll 管理大量连接，不会让一个慢客户端阻塞其他客户端。
 请求解析器支持
 Header、`Content-Length`
@@ -18,6 +18,7 @@ Body 缓冲的大文件上传和下载。
 .
 ├── .gitignore      # 不让编译产物和运行数据进入版本库
 ├── CMakeLists.txt  # 告诉 CMake 如何编译项目
+├── deploy/         # Nginx HTTPS 与 systemd 部署示例
 ├── BACKEND_PLAN.md # 个人云后端的分阶段实施计划
 ├── README.md       # 当前进度和学习任务
 ├── guide.md        # 项目整体规划
@@ -49,7 +50,10 @@ Body 缓冲的大文件上传和下载。
 │   ├── http_server.cpp     # Socket 层系统调用及错误处理
 │   ├── router.cpp          # method/path 匹配和响应生成
 │   ├── thread_pool.cpp     # 异步应用任务使用的有界工作线程池
+│   ├── cloud_admin.cpp     # 备份、清理和存储一致性检查工具
 │   └── main.cpp            # 设置参数并启动 epoll 服务器
+├── tools/
+│   └── benchmark.py        # 可重复的并发 HTTP 压测
 └── tests/
     ├── backend_test.cpp     # 配置、迁移、持久化和应用接口测试
     ├── http_test.cpp        # Request、Router 和 Response 测试
@@ -125,7 +129,9 @@ Socket 前被拒绝。首次启动时会自动创建数据库目录、文件存�
 ./build/http_server
 ```
 
-页面文件目前按相对路径从 `public/` 读取，因此应从项目根目录运行上述命令。
+页面文件目前按相对路径从 `public/` 读取，因此应从项目根目录运行上述命令。访问
+`http://127.0.0.1:9000/app` 可打开亮色控制台，完成注册、登录和文件管理；页面
+支持拖放、多文件顺序上传、实时进度、名称搜索和窄屏布局。
 
 后端状态接口：
 
@@ -190,7 +196,9 @@ Token 使用 32 字节安全随机数，只通过 `Set-Cookie` 发给客户端�
 ## 文件 API
 
 文件接口使用登录得到的 `pc_session` Cookie。上传 Body 是文件原始字节，展示名称
-通过 `X-File-Name` 传入，`Content-Type` 会保存为文件 MIME：
+通过 `X-File-Name` 传入，`Content-Type` 会保存为文件 MIME。浏览器等客户端若要
+传输 UTF-8 或空格文件名，可同时发送 `X-File-Name-Encoding: percent`，此时名称
+必须使用严格百分号编码：
 
 ```bash
 curl -i -b /tmp/personal-cloud-cookie.txt \
@@ -232,6 +240,69 @@ curl -i -b /tmp/personal-cloud-cookie.txt -X DELETE \
 文件。服务端生成的存储键不会暴露给 API，所有文件查询同时校验当前 Session 和
 所有者。
 
+`GET /api/files` 还会返回 `usage`，包括已用字节数、总容量、文件总数、本次返回
+数和列表是否截断。所有网络响应都有 `X-Request-ID`；协议层与 API 错误使用统一
+格式，前端会显示缩短后的请求 ID，便于定位日志：
+
+```json
+{"error":{"code":"bad_request","message":"Bad request"}}
+```
+
+使用 `--verbose` 启动时，请求接收与完成日志为单行 JSON，包含时间戳、请求 ID、
+fd、方法、路径和状态码，不包含 Cookie、请求 Body 或密码。
+
+## 运维工具
+
+构建后会生成 `build/cloud_admin`：
+
+```bash
+./build/cloud_admin backup \
+    --database data/personal_cloud.db --output backups/cloud.db
+
+./build/cloud_admin check \
+    --database data/personal_cloud.db --storage-root data/files
+
+# 默认只预演；确认输出后才显式执行
+./build/cloud_admin cleanup --storage-root data/files --older-than 86400
+./build/cloud_admin cleanup --storage-root data/files \
+    --older-than 86400 --apply
+```
+
+备份使用 SQLite 在线备份 API 且默认拒绝覆盖已有目标。`cleanup` 只扫描 `tmp/` 和
+`trash/` 下超过指定秒数的普通文件，从不删除 `objects/`。生产环境建议先备份、
+执行 `check`，再运行清理。
+
+## 并发压测
+
+脚本只依赖 Python 标准库：
+
+```bash
+python3 tools/benchmark.py http://127.0.0.1:9000 \
+    --path /health --requests 5000 --concurrency 64 \
+    --server-pid SERVER_PID --output benchmark.json
+```
+
+JSON 报告包含吞吐、平均延迟、p50/p95/p99/max、HTTP 状态/失败分布，以及可选的
+Linux 进程 RSS 和打开 fd 前后值。对比优化前后结果时应固定硬件、构建类型、请求
+数和并发数，并先进行一轮预热。
+
+## 生产部署
+
+`deploy/nginx.conf.example` 提供 HTTPS 终止、1 GiB Body 上限、关闭请求/响应代理
+缓冲和为 Session Cookie 添加 `Secure` 的示例；请替换域名与证书路径。
+`deploy/personal-cloud.service` 使用 `DynamicUser`、`StateDirectory` 和 systemd
+沙箱限制，假设二进制及 `public/` 安装在 `/opt/personal-cloud`。
+
+```bash
+sudo cp deploy/personal-cloud.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now personal-cloud
+sudo journalctl -u personal-cloud -f
+```
+
+Nginx 配置需按实际域名修改，并经 `nginx -t` 验证后启用。当前程序默认监听所有
+地址，生产主机应通过防火墙只开放 Nginx 的 80/443 端口。
+
 在另一个终端使用 netcat 连接：
 
 ```bash
@@ -245,12 +316,10 @@ printf 'GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n' |
     nc -N 127.0.0.1 9000
 ```
 
-将 `main.cpp` 中的 `verbose_logging` 设为 `true` 后，服务器终端会输出：
+传入 `--verbose` 后，服务器终端会输出结构化请求日志：
 
 ```text
-Client connected, fd = 5
-Parsed request, fd = 5, method = GET, path = /hello, body = 0 bytes
-Response sent; closing client fd = 5
+{"timestamp_ms":0,"level":"info","event":"request_completed","request_id":"...","fd":5,"method":"GET","path":"/hello","status":200}
 ```
 
 当前采用单线程 epoll 边缘触发（ET）模型。监听 Socket 和客户端 Socket 都是
@@ -344,9 +413,10 @@ accept 队列，但会立即关闭超出的连接，防止连接状态无界增�
 - 为什么 `EMFILE` 时需要保留 fd、暂停监听和显式重新启用 one-shot 事件。
 - 为什么用 `signalfd` 可以让信号处理保持在普通同步代码中。
 
-后端后续顺序和各阶段验收标准见 `BACKEND_PLAN.md`。用户与文件最小闭环（阶段
-1–5）已经完成，下一步是阶段 6 的前端真实 API 接入、请求 ID/结构化日志、启动
-临时文件清扫和数据库/磁盘一致性检查、备份与可重复压力测试。
+后端顺序和各阶段验收标准见 `BACKEND_PLAN.md`。阶段 1–6 已完成，当前具备用户与
+文件最小闭环、亮色控制台、请求关联日志、备份/检查/清理工具、压测脚本和生产
+部署基线。下一步可从 cursor 分页、Range 下载、浏览器自动化测试和备份恢复演练
+中选择高价值项目继续推进。
 
 ## 学习约定
 

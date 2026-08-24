@@ -349,6 +349,10 @@ private:
     bool started_{false};
 };
 
+std::string response_header_value(
+    const ExchangeResult& result,
+    std::string_view name);
+
 void test_live_protocol(std::uint16_t port) {
     ExchangeResult result = exchange(
         port,
@@ -358,6 +362,8 @@ void test_live_protocol(std::uint16_t port) {
            "serve a request after the client half-closes its write side");
     expect(result.response.ends_with("\r\n\r\nOK\n"),
            "send the complete health response body");
+    expect(!response_header_value(result, "X-Request-ID").empty(),
+           "attach a request ID to every normal response");
 
     result = exchange(
         port,
@@ -375,6 +381,24 @@ void test_live_protocol(std::uint16_t port) {
     result = exchange(port, {"GET /hello HTTP/1.1\r\n\r\n"});
     expect(has_status(result, "HTTP/1.1 400 Bad Request\r\n"),
            "reject a live HTTP/1.1 request without Host");
+    expect(response_header_value(result, "Content-Type") ==
+               "application/json; charset=utf-8" &&
+               !response_header_value(result, "X-Request-ID").empty() &&
+               result.response.find(
+                   "\"code\":\"bad_request\"") != std::string::npos,
+           "return protocol errors as request-correlated JSON");
+
+    result = exchange(
+        port,
+        {"POST /hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"});
+    expect(has_status(result, "HTTP/1.1 405 Method Not Allowed\r\n") &&
+               response_header_value(result, "Content-Type") ==
+                   "application/json; charset=utf-8" &&
+               response_header_value(result, "Allow") == "GET" &&
+               result.response.find(
+                   "\"code\":\"method_not_allowed\"") !=
+                   std::string::npos,
+           "normalize legacy route errors to JSON without losing headers");
 
     result = exchange(
         port,
@@ -1050,7 +1074,8 @@ void test_live_streaming_file_api() {
         "POST /api/files HTTP/1.1\r\nHost: localhost\r\nCookie: ";
     upload_head += owner_cookie;
     upload_head +=
-        "\r\nX-File-Name: streamed.bin\r\n"
+        "\r\nX-File-Name: %E6%B5%8B%E8%AF%95%20file.bin\r\n"
+        "X-File-Name-Encoding: percent\r\n"
         "Content-Type: application/octet-stream\r\nContent-Length: ";
     upload_head += std::to_string(content.size());
     upload_head += "\r\n\r\n";
@@ -1068,6 +1093,9 @@ void test_live_streaming_file_api() {
         const nlohmann::json body =
             nlohmann::json::parse(response_body(response.response));
         file_id = body["file"]["id"].get<std::string>();
+        expect(body["file"]["name"].get<std::string>() ==
+                   "测试 file.bin",
+               "decode browser-safe percent-encoded UTF-8 upload names");
     }
 
     std::string metadata_request =

@@ -44,6 +44,14 @@ target_link_libraries(http_server
         nlohmann_json::nlohmann_json
 )
 
+add_executable(cloud_admin src/cloud_admin.cpp)
+target_compile_features(cloud_admin PRIVATE cxx_std_20)
+target_link_libraries(cloud_admin
+    PRIVATE
+        SQLite::SQLite3
+        nlohmann_json::nlohmann_json
+)
+
 # GCC 和 Clang 使用的常见警告选项。
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(http_server
@@ -52,6 +60,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
             -Wextra
             -Wpedantic
     )
+    target_compile_options(cloud_admin PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # 启用 CTest，并在 BUILD_TESTING=ON 时构建 HTTP 单元测试。
@@ -184,4 +193,15 @@ if(BUILD_TESTING)
     set_tests_properties(backend_tests PROPERTIES
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
     )
+
+    find_program(SQLITE3_EXECUTABLE sqlite3)
+    if(SQLITE3_EXECUTABLE)
+        add_test(
+            NAME cloud_admin_tests
+            COMMAND bash
+                "${PROJECT_SOURCE_DIR}/tests/cloud_admin_test.sh"
+                "$<TARGET_FILE:cloud_admin>"
+                "${SQLITE3_EXECUTABLE}"
+        )
+    endif()
 endif()

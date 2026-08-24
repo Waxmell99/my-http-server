@@ -1,8 +1,10 @@
+#include "common/structured_log.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "http/router.h"
 
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -324,13 +326,46 @@ void test_response_serialization() {
     expect(serialized == expected,
            "serialize status line, headers, and body");
 
+    const std::string with_transport_header =
+        personal_cloud::serialize_http_response(
+            response, {{"X-Request-ID", "request-123"}});
+    expect(with_transport_header.find(
+               "\r\nX-Request-ID: request-123\r\n") != std::string::npos &&
+               with_transport_header.ends_with("\r\n\r\nabc"),
+           "add transport headers without copying or changing the body");
+
     const std::string streamed_head =
-        personal_cloud::serialize_http_response_head(response, 1000000);
+        personal_cloud::serialize_http_response_head(
+            response, 1000000, {{"X-Request-ID", "stream-456"}});
     expect(streamed_head.find("Content-Length: 1000000\r\n") !=
+                   std::string::npos &&
+               streamed_head.find("X-Request-ID: stream-456\r\n") !=
                    std::string::npos &&
                streamed_head.ends_with("\r\n\r\n") &&
                streamed_head.find("abc") == std::string::npos,
            "serialize a streaming response head without buffering its body");
+}
+
+void test_structured_request_log() {
+    std::ostringstream output;
+    personal_cloud::write_request_log(
+        output,
+        "request_completed",
+        "req-1",
+        7,
+        "GET",
+        "/quoted\"path",
+        200);
+    const std::string line = output.str();
+    expect(line.find("\"event\":\"request_completed\"") !=
+                   std::string::npos &&
+               line.find("\"request_id\":\"req-1\"") !=
+                   std::string::npos &&
+               line.find("\"path\":\"/quoted\\\"path\"") !=
+                   std::string::npos &&
+               line.find("\"status\":200") != std::string::npos &&
+               line.ends_with('\n'),
+           "emit escaped one-line structured request logs");
 }
 
 }  // namespace
@@ -342,6 +377,7 @@ int main() {
     test_request_body();
     test_routing();
     test_response_serialization();
+    test_structured_request_log();
 
     if (failure_count != 0) {
         std::cerr << failure_count << " test assertion(s) failed.\n";

@@ -330,6 +330,16 @@ std::int64_t Database::total_file_size(std::int64_t user_id) const {
     return ::sqlite3_column_int64(statement.get(), 0);
 }
 
+std::int64_t Database::file_count(std::int64_t user_id) const {
+    Statement statement(
+        connection_, "SELECT COUNT(*) FROM files WHERE user_id = ?1;");
+    statement.bind_int64(1, user_id);
+    if (::sqlite3_step(statement.get()) != SQLITE_ROW) {
+        throw sqlite_error(connection_, "Cannot count files");
+    }
+    return ::sqlite3_column_int64(statement.get(), 0);
+}
+
 bool Database::create_file(const StoredFile& file) {
     execute("BEGIN IMMEDIATE;");
     try {

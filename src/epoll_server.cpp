@@ -1,6 +1,7 @@
 #include "server/epoll_server.h"
 
 #include "common/log.h"
+#include "common/structured_log.h"
 #include "concurrency/thread_pool.h"
 #include "http/http_request.h"
 #include "http/http_response.h"
@@ -91,6 +92,10 @@ struct ClientConnection {
     std::string pending_upload_bytes;
     std::shared_ptr<DownloadStream> download_stream;
     bool download_end_of_file{false};
+    std::string request_id;
+    std::string request_method;
+    std::string request_path;
+    int response_status{0};
 };
 
 struct TaskCompletion {
@@ -108,12 +113,55 @@ HttpResponse make_error_response(
     int status_code,
     std::string reason,
     std::string body) {
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) {
+        body.pop_back();
+    }
+    std::string code = "http_error";
+    switch (status_code) {
+        case 400: code = "bad_request"; break;
+        case 401: code = "authentication_required"; break;
+        case 403: code = "forbidden"; break;
+        case 404: code = "not_found"; break;
+        case 405: code = "method_not_allowed"; break;
+        case 409: code = "conflict"; break;
+        case 408: code = "request_timeout"; break;
+        case 413: code = "payload_too_large"; break;
+        case 415: code = "unsupported_media_type"; break;
+        case 417: code = "expectation_failed"; break;
+        case 422: code = "unprocessable_content"; break;
+        case 429: code = "too_many_requests"; break;
+        case 431: code = "headers_too_large"; break;
+        case 500: code = "internal_error"; break;
+        case 503: code = "service_unavailable"; break;
+        case 505: code = "version_not_supported"; break;
+        default: break;
+    }
     return {
         status_code,
         std::move(reason),
-        "text/plain; charset=utf-8",
-        std::move(body),
+        "application/json; charset=utf-8",
+        "{\"error\":{\"code\":\"" + code +
+            "\",\"message\":\"" + json_escape(body) + "\"}}\n",
     };
+}
+
+std::string make_request_id(std::uint64_t connection_id) {
+    const auto timestamp = static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    std::array<char, 64> buffer{};
+    const int length = std::snprintf(
+        buffer.data(),
+        buffer.size(),
+        "%08x-%016llx-%016llx",
+        static_cast<unsigned int>(::getpid()),
+        timestamp,
+        static_cast<unsigned long long>(connection_id));
+    if (length <= 0 || static_cast<std::size_t>(length) >= buffer.size()) {
+        return std::to_string(connection_id);
+    }
+    return std::string(buffer.data(), static_cast<std::size_t>(length));
 }
 
 std::string content_disposition(std::string_view name) {
@@ -456,6 +504,7 @@ private:
             const std::uint64_t connection_id = allocate_connection_id();
             ClientConnection new_connection;
             new_connection.id = connection_id;
+            new_connection.request_id = make_request_id(connection_id);
             auto [connection, inserted] = clients_.try_emplace(
                 client_fd,
                 std::move(new_connection));
@@ -680,16 +729,21 @@ private:
                             "Expectation Failed\n"));
                 }
 
+                request.request_id = connection.request_id;
+                connection.request_method = request.method;
+                const std::string_view request_path(request.path);
+                connection.request_path = request_path.substr(
+                    0, request_path.find('?'));
+
                 if (config_.verbose_logging) {
-                    const std::string_view logged_path(request.path);
-                    write_log(
+                    write_request_log(
                         std::cout,
-                        "Parsed request, fd = ", client_fd,
-                        ", method = ", request.method,
-                        ", path = ", logged_path.substr(
-                            0, logged_path.find('?')),
-                        ", body = ", request.body.size(),
-                        " bytes\n");
+                        "request_received",
+                        connection.request_id,
+                        client_fd,
+                        connection.request_method,
+                        connection.request_path,
+                        0);
                 }
                 return begin_request_processing(
                     client_fd, connection, request);
@@ -733,6 +787,7 @@ private:
         if (result != HttpParseResult::complete) {
             return std::nullopt;
         }
+        request.request_id = connection.request_id;
 
         std::optional<UploadPreparationTask> task;
         try {
@@ -765,6 +820,21 @@ private:
         }
         if (!task.has_value()) {
             return std::nullopt;
+        }
+
+        connection.request_method = request.method;
+        const std::string_view upload_path(request.path);
+        connection.request_path = upload_path.substr(
+            0, upload_path.find('?'));
+        if (config_.verbose_logging) {
+            write_request_log(
+                std::cout,
+                "request_received",
+                connection.request_id,
+                client_fd,
+                connection.request_method,
+                connection.request_path,
+                0);
         }
 
         const std::size_t buffered_body_size =
@@ -982,11 +1052,14 @@ private:
         }
 
         if (config_.verbose_logging) {
-            write_log(
+            write_request_log(
                 std::cout,
-                "Response sent; closing client fd = ",
+                "request_completed",
+                connection.request_id,
                 client_fd,
-                '\n');
+                connection.request_method,
+                connection.request_path,
+                connection.response_status);
         }
         return false;
     }
@@ -1088,6 +1161,16 @@ private:
         connection.response_buffer.clear();
         connection.sent_size = 0;
         if (connection.download_end_of_file) {
+            if (config_.verbose_logging) {
+                write_request_log(
+                    std::cout,
+                    "request_completed",
+                    connection.request_id,
+                    client_fd,
+                    connection.request_method,
+                    connection.request_path,
+                    connection.response_status);
+            }
             return false;
         }
         return schedule_download_read(client_fd, connection);
@@ -1473,10 +1556,13 @@ private:
                               connection.download_stream->original_name())}},
                     };
                     connection.response_buffer = serialize_http_response_head(
-                        response_head, connection.download_stream->size());
+                        response_head,
+                        connection.download_stream->size(),
+                        {{"X-Request-ID", connection.request_id}});
                     connection.sent_size = 0;
                     connection.download_end_of_file =
                         connection.download_stream->size() == 0;
+                    connection.response_status = 200;
                     connection.state = ConnectionState::download_sending;
                     keep_connection = modify_client_events(
                         completion.client_fd,
@@ -1540,7 +1626,18 @@ private:
         int client_fd,
         ClientConnection& connection,
         const HttpResponse& response) {
-        connection.response_buffer = serialize_http_response(response);
+        std::optional<HttpResponse> normalized_response;
+        const HttpResponse* response_to_send = &response;
+        if (response.status_code >= 400 &&
+            !response.content_type.starts_with("application/json")) {
+            normalized_response.emplace(make_error_response(
+                response.status_code, response.reason, response.body));
+            normalized_response->headers = response.headers;
+            response_to_send = &*normalized_response;
+        }
+        connection.response_buffer = serialize_http_response(
+            *response_to_send, {{"X-Request-ID", connection.request_id}});
+        connection.response_status = response_to_send->status_code;
         connection.sent_size = 0;
         connection.state = ConnectionState::sending;
         connection.last_activity = Clock::now();

@@ -1,0 +1,29 @@
+[Unit]
+Description=Personal Cloud HTTP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=personal-cloud
+WorkingDirectory=/opt/personal-cloud
+ExecStart=/opt/personal-cloud/http_server --port 9000 --database /var/lib/personal-cloud/cloud.db --storage-root /var/lib/personal-cloud/files --worker-count 4 --task-queue-size 256 --verbose
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
