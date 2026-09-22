@@ -147,9 +147,10 @@ curl http://127.0.0.1:9000/api/status
 {"status":"ok","database":"ok","schema_version":1}
 ```
 
-`/api/status` 已接入异步任务桥。worker 通过完成队列和 Linux `eventfd` 把响应
-交还给 epoll 线程；worker 不直接操作 Socket。每个连接使用独立的 64 位连接 ID，
-避免 fd 复用后把旧任务响应发送给新客户端。
+`/api/status` 已接入异步任务桥，并在每次请求时使用独立 SQLite 连接执行实时健康
+检查。worker 通过完成队列和 Linux `eventfd` 把响应交还给 epoll 线程；worker
+不直接操作 Socket。每个连接使用独立的 64 位连接 ID，避免 fd 复用后把旧任务响应
+发送给新客户端。
 
 ## 用户认证 API
 

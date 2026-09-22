@@ -42,7 +42,6 @@ private:
     std::shared_ptr<AuthService> auth_service_;
     std::shared_ptr<FileService> file_service_;
     int schema_version_{0};
-    bool database_ready_{false};
 };
 
 }  // namespace personal_cloud

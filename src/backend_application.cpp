@@ -80,8 +80,7 @@ HttpResponse json_error(
 
 HttpResponse status_response(
     const HttpRequest& request,
-    bool database_ready,
-    int schema_version) {
+    const std::filesystem::path& database_path) {
     if (request.method != "GET") {
         return json_error(
             405,
@@ -91,21 +90,27 @@ HttpResponse status_response(
             {{"Allow", "GET"}});
     }
 
-    if (!database_ready) {
-        return json_error(
-            503,
-            "Service Unavailable",
-            "database_unavailable",
-            "Database is unavailable");
+    try {
+        Database database(
+            database_path, DatabaseOpenMode::existing_schema);
+        if (database.health_check()) {
+            return {
+                200,
+                "OK",
+                "application/json; charset=utf-8",
+                "{\"status\":\"ok\",\"database\":\"ok\","
+                "\"schema_version\":" +
+                    std::to_string(database.schema_version()) + "}\n",
+            };
+        }
+    } catch (const std::exception&) {
     }
 
-    return {
-        200,
-        "OK",
-        "application/json; charset=utf-8",
-        "{\"status\":\"ok\",\"database\":\"ok\",\"schema_version\":" +
-            std::to_string(schema_version) + "}\n",
-    };
+    return json_error(
+        503,
+        "Service Unavailable",
+        "database_unavailable",
+        "Database is unavailable");
 }
 
 }  // namespace
@@ -118,8 +123,7 @@ BackendApplication::BackendApplication(const BackendConfig& config)
           database_path_, config.allow_registration)),
       file_service_(std::make_shared<FileService>(
           config, auth_service_, database_path_, storage_root_)),
-      schema_version_(database_.schema_version()),
-      database_ready_(database_.health_check()) {}
+      schema_version_(database_.schema_version()) {}
 
 HttpResponse BackendApplication::handle_request(const HttpRequest& request) {
     const std::string_view path = path_without_query(request.path);
@@ -127,7 +131,7 @@ HttpResponse BackendApplication::handle_request(const HttpRequest& request) {
         return route_request(request);
     }
 
-    return status_response(request, database_ready_, schema_version_);
+    return status_response(request, database_path_);
 }
 
 std::optional<ApplicationTask> BackendApplication::make_task(
@@ -162,12 +166,10 @@ std::optional<ApplicationTask> BackendApplication::make_task(
         return std::nullopt;
     }
 
-    // 只捕获不可变快照，既不引用 epoll 解析缓冲区，也不让 worker 访问启动线程
-    // 拥有的 SQLite 连接。后续 DB 任务必须在 worker 内创建独占连接。
-    const bool database_ready = database_ready_;
-    const int schema_version = schema_version_;
-    return [request, database_ready, schema_version] {
-        return status_response(request, database_ready, schema_version);
+    // worker 使用独立连接执行实时检查，不访问启动线程拥有的 SQLite 连接。
+    const std::filesystem::path database_path = database_path_;
+    return [request, database_path] {
+        return status_response(request, database_path);
     };
 }
 

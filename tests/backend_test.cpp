@@ -401,6 +401,26 @@ void test_rejects_newer_schema() {
     expect(rejected, "reject a database created by a newer server version");
 }
 
+void test_status_detects_runtime_database_loss() {
+    TemporaryDirectory temporary;
+    const std::filesystem::path database_path = temporary.path() / "status.db";
+    personal_cloud::BackendConfig config;
+    config.database_path = database_path;
+    config.storage_root = temporary.path() / "files";
+
+    personal_cloud::BackendApplication application(config);
+    std::filesystem::rename(
+        database_path, temporary.path() / "status.db.moved");
+
+    const personal_cloud::HttpResponse response = run_application_task(
+        application,
+        {"GET", "/api/status", "HTTP/1.1", {}, {}});
+    expect(response.status_code == 503 &&
+               response.body.find("database_unavailable") !=
+                   std::string::npos,
+           "report a database failure that occurs after startup");
+}
+
 void test_rejects_incomplete_schema() {
     TemporaryDirectory temporary;
     const std::filesystem::path database_path =
@@ -1015,6 +1035,7 @@ int main() {
     try {
         test_configuration();
         test_database_migrations_and_persistence();
+        test_status_detects_runtime_database_loss();
         test_rejects_newer_schema();
         test_rejects_incomplete_schema();
         test_authentication_lifecycle_and_security();
