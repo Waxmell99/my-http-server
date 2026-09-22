@@ -74,37 +74,7 @@ HttpResponse route_request(const HttpRequest& request) {
         path = path.substr(0, query_start);
     }
 
-    if (path == "/") {
-        if (request.method != "GET") {
-            return {
-                405,
-                "Method Not Allowed",
-                "text/plain; charset=utf-8",
-                "Method Not Allowed\n",
-                {{"Allow", "GET"}},
-            };
-        }
-
-        const auto html = read_file("public/index_ds.html");
-        if (!html.has_value()) {
-            return {
-                500,
-                "Internal Server Error",
-                "text/plain; charset=utf-8",
-                "Cannot open public/index_ds.html\n",
-            };
-        }
-
-        return {
-            200,
-            "OK",
-            "text/html; charset=utf-8",
-            *html,
-        };
-
-    }
-
-    if (path == "/app") {
+    if (path == "/" || path == "/app") {
         if (request.method != "GET") {
             return {
                 405,
@@ -131,6 +101,7 @@ HttpResponse route_request(const HttpRequest& request) {
             "text/html; charset=utf-8",
             *html,
         };
+
     }
 
     if (path == "/turntable") {
