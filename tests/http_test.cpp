@@ -257,16 +257,19 @@ void test_routing() {
 
     response = personal_cloud::route_request(
         {"GET", "/", "HTTP/1.1", {}, {}});
-    expect(response.status_code == 200, "GET / returns the cloud console");
-    expect(response.body.find("/api/auth/me") != std::string::npos,
-           "root serves the authentication and file console");
+    expect(response.status_code == 200, "GET / returns the personal home page");
+    expect(response.body.find("id=\"cloudEntry\"") != std::string::npos &&
+               response.body.find("href=\"/app\"") != std::string::npos &&
+               response.body.find("fetch('/api/status'") != std::string::npos,
+           "home page links to the cloud console and reports live status");
 
     const personal_cloud::HttpResponse app_alias =
         personal_cloud::route_request(
             {"GET", "/app", "HTTP/1.1", {}, {}});
     expect(app_alias.status_code == 200 &&
-               app_alias.body == response.body,
-           "keep /app as an alias for the root console");
+               app_alias.body.find("/api/auth/me") != std::string::npos &&
+               app_alias.body != response.body,
+           "serve the authentication and file console from /app");
 
     response = personal_cloud::route_request(
         {"GET", "/missing", "HTTP/1.1", {}, {}});

@@ -85,13 +85,16 @@ HttpResponse route_request(const HttpRequest& request) {
             };
         }
 
-        const auto html = read_file("public/app.html");
+        const std::string file_path = path == "/"
+            ? "public/index.html"
+            : "public/app.html";
+        const auto html = read_file(file_path);
         if (!html.has_value()) {
             return {
                 500,
                 "Internal Server Error",
                 "text/plain; charset=utf-8",
-                "Cannot open public/app.html\n",
+                "Cannot open " + file_path + "\n",
             };
         }
 
