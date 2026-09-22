@@ -5,6 +5,7 @@
 当前进度：已经完成非阻塞 Socket、epoll 事件循环、HTTP Request/Response、
 路由、超时清理、优雅停机、SQLite 持久化、异步任务桥、用户/Session 认证、
 流式文件上传/下载、文件管理、亮色 Web 控制台、请求 ID、运维工具和端到端测试。
+运维工具支持把 SQLite 快照和全部文件对象写入一个经过校验的归档，并从归档恢复。
 服务器使用单线程 epoll 管理大量连接，不会让一个慢客户端阻塞其他客户端。
 请求解析器支持
 Header、`Content-Length`
@@ -52,7 +53,7 @@ Body 缓冲的大文件上传和下载。
 │   ├── http_server.cpp     # Socket 层系统调用及错误处理
 │   ├── router.cpp          # method/path 匹配和响应生成
 │   ├── thread_pool.cpp     # 异步应用任务使用的有界工作线程池
-│   ├── cloud_admin.cpp     # 备份、清理和存储一致性检查工具
+│   ├── cloud_admin.cpp     # 备份、恢复、清理和存储一致性检查工具
 │   └── main.cpp            # 设置参数并启动 epoll 服务器
 ├── tools/
 │   └── benchmark.py        # 可重复的并发 HTTP 压测
@@ -112,14 +113,24 @@ ctest --test-dir build --output-on-failure
     --max-file-size 1073741824 \
     --user-quota 10737418240 \
     --max-concurrent-uploads 4 \
-    --stream-buffer-size 65536 \
-    --allow-registration
+    --stream-buffer-size 65536
 ```
 
 使用 `./build/http_server --help` 可以查看全部选项。非法配置会在创建监听
 Socket 前被拒绝。首次启动时会自动创建数据库目录、文件存储目录和 Schema；
 当前第一版迁移包含 `users`、`sessions`、`files` 及必要索引。存储根下会创建
 `objects/`、`tmp/` 和 `trash/`。SQLite 会启用外键、WAL 和 5 秒 busy timeout。
+
+### 重要的默认行为
+
+- 服务默认只监听 `127.0.0.1:9000`，适合放在同机 Nginx 后面。需要让其他主机
+  直接访问时，必须显式传入 `--bind-address 0.0.0.0`，并配置防火墙。
+- 账号注册默认关闭；已有账号仍可正常登录。只有在创建账号期间才应加入
+  `--allow-registration`，完成后移除参数并重启服务。
+- `/api/status` 每次请求都会实时打开数据库、执行健康检查并读取 Schema，不再使用
+  启动时缓存的数据库状态。
+- `cloud_admin backup` 现在必须同时接收 `--database` 和 `--storage-root`，生成包含
+  数据库与文件对象的 `.pcbackup` 单文件归档；原先只备份数据库的命令格式已停用。
 
 可能访问数据库或文件系统的请求通过有界应用工作线程池执行。等待队列满时服务
 返回 `503 Service Unavailable`，不会继续无界积累任务。`/health` 等纯内存快速
@@ -134,8 +145,9 @@ Socket 前被拒绝。首次启动时会自动创建数据库目录、文件存�
 ```
 
 页面文件目前按相对路径从 `public/` 读取，因此应从项目根目录运行上述命令。访问
-`http://127.0.0.1:9000/app` 可打开亮色控制台，完成注册、登录和文件管理；页面
-支持拖放、多文件顺序上传、实时进度、名称搜索和窄屏布局。
+`http://127.0.0.1:9000/app` 可打开亮色控制台，完成登录和文件管理；启用注册后也
+可以从该页面创建账号。页面支持拖放、多文件顺序上传、实时进度、名称搜索和窄屏
+布局。
 
 后端状态接口：
 
@@ -152,12 +164,18 @@ curl http://127.0.0.1:9000/api/status
 `/api/status` 已接入异步任务桥，并在每次请求时使用独立 SQLite 连接执行实时健康
 检查。worker 通过完成队列和 Linux `eventfd` 把响应交还给 epoll 线程；worker
 不直接操作 Socket。每个连接使用独立的 64 位连接 ID，避免 fd 复用后把旧任务响应
-发送给新客户端。
+发送给新客户端。数据库无法打开、查询失败或 Schema 不可读时，接口返回
+`503 Service Unavailable` 和 `database_unavailable` 错误。
 
 ## 用户认证 API
 
 注册默认关闭，避免公网服务被任意创建账号。需要创建账号时，以
 `--allow-registration` 启动服务；创建完成后移除该参数并重启。注册请求：
+
+```bash
+# 首次创建账号时临时启用注册
+./build/http_server --allow-registration
+```
 
 ```bash
 curl -i \
@@ -288,6 +306,9 @@ fd、方法、路径和状态码，不包含 Cookie、请求 Body 或密码。
 哈希，并拒绝覆盖已有数据库或存储目录。恢复前应停止服务器，完成后先执行 `check`
 再切换服务路径。`cleanup` 只扫描 `tmp/` 和 `trash/` 下超过指定秒数的普通文件，
 从不删除 `objects/`。
+
+需要替换已经存在的备份归档时，可在 `backup` 命令末尾加入 `--force`。`restore`
+没有覆盖选项：数据库路径和存储根都必须不存在，防止误删现有数据。
 
 ## 并发压测
 
@@ -432,9 +453,9 @@ accept 队列，但会立即关闭超出的连接，防止连接状态无界增�
 - 为什么用 `signalfd` 可以让信号处理保持在普通同步代码中。
 
 后端顺序和各阶段验收标准见 `BACKEND_PLAN.md`。阶段 1–6 已完成，当前具备用户与
-文件最小闭环、亮色控制台、请求关联日志、备份/检查/清理工具、压测脚本和生产
-部署基线。下一步可从 cursor 分页、Range 下载、浏览器自动化测试和备份恢复演练
-中选择高价值项目继续推进。
+文件最小闭环、亮色控制台、请求关联日志、备份/恢复/检查/清理工具、压测脚本和
+生产部署基线。下一步可从 cursor 分页、Range 下载、浏览器自动化测试、自动备份
+调度和异机恢复演练中选择高价值项目继续推进。
 
 ## 学习约定
 
