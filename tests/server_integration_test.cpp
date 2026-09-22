@@ -1221,7 +1221,7 @@ int main() {
                "close active client Sockets during graceful shutdown");
 
         const int listening_fd =
-            personal_cloud::create_listening_socket(port, 1);
+            personal_cloud::create_listening_socket("127.0.0.1", port, 1);
         expect(listening_fd >= 0,
                "release the listening Socket when the event loop stops");
 

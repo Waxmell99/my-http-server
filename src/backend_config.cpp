@@ -8,6 +8,8 @@
 #include <system_error>
 #include <utility>
 
+#include <arpa/inet.h>
+
 namespace personal_cloud {
 namespace {
 
@@ -70,6 +72,23 @@ ConfigParseResult parse_backend_config(
                 };
             }
             config.server.port = port;
+            continue;
+        }
+
+        if (option == "--bind-address") {
+            if (++index >= arguments.size()) {
+                return missing_value(option);
+            }
+            in_addr parsed_address {};
+            const std::string address(arguments[index]);
+            if (::inet_pton(AF_INET, address.c_str(), &parsed_address) != 1) {
+                return {
+                    std::nullopt,
+                    "Invalid IPv4 bind address: " + address,
+                    false,
+                };
+            }
+            config.server.bind_address = address;
             continue;
         }
 
@@ -228,6 +247,7 @@ std::string backend_usage(std::string_view program_name) {
     usage += program_name;
     usage += " [options]\n\n";
     usage += "Options:\n";
+    usage += "  --bind-address <IPv4>     Listening address (default: 127.0.0.1)\n";
     usage += "  --port <1-65535>          Listening port (default: 9000)\n";
     usage += "  --database <path>         SQLite database path\n";
     usage += "  --storage-root <path>     Stored file directory\n";

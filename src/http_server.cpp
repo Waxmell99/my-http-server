@@ -2,8 +2,10 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <string>
 
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -32,7 +34,10 @@ bool is_transient_accept_error(int error) noexcept {
 
 }  // namespace
 
-int create_listening_socket(std::uint16_t port, int backlog) {
+int create_listening_socket(
+    std::string_view bind_address,
+    std::uint16_t port,
+    int backlog) {
     const int socket_fd = ::socket(
         AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (socket_fd == -1) {
@@ -54,7 +59,16 @@ int create_listening_socket(std::uint16_t port, int backlog) {
     sockaddr_in address {};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    const std::string null_terminated_address(bind_address);
+    if (::inet_pton(
+            AF_INET,
+            null_terminated_address.c_str(),
+            &address.sin_addr) != 1) {
+        std::fprintf(stderr, "Invalid IPv4 bind address: %s\n",
+                     null_terminated_address.c_str());
+        close_socket(socket_fd);
+        return -1;
+    }
 
     if (::bind(socket_fd,
                reinterpret_cast<const sockaddr*>(&address),

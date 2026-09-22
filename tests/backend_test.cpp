@@ -202,6 +202,8 @@ void test_configuration() {
     if (result.config.has_value()) {
         expect(result.config->server.port == 9000,
                "use the documented default port");
+        expect(result.config->server.bind_address == "127.0.0.1",
+               "listen only on IPv4 loopback by default");
         expect(result.config->database_path == "data/personal_cloud.db",
                "use the documented default database path");
         expect(result.config->storage_root == "data/files",
@@ -211,6 +213,8 @@ void test_configuration() {
     result = parse({
         "--port",
         "18080",
+        "--bind-address",
+        "0.0.0.0",
         "--database",
         "/tmp/cloud.db",
         "--storage-root",
@@ -237,6 +241,8 @@ void test_configuration() {
     if (result.config.has_value()) {
         expect(result.config->server.port == 18080,
                "parse the configured port");
+        expect(result.config->server.bind_address == "0.0.0.0",
+               "parse the configured IPv4 bind address");
         expect(result.config->server.maximum_connections == 321,
                "parse the configured connection limit");
         expect(result.config->server.idle_timeout.count() == 17,
@@ -264,6 +270,8 @@ void test_configuration() {
            "reject port zero");
     expect(!parse({"--port", "65536"}).config.has_value(),
            "reject a port above uint16 range");
+    expect(!parse({"--bind-address", "localhost"}).config.has_value(),
+           "reject a non-numeric IPv4 bind address");
     expect(!parse({"--idle-timeout", "-1"}).config.has_value(),
            "reject a negative idle timeout");
     expect(!parse({"--database"}).config.has_value(),

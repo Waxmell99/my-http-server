@@ -10,6 +10,7 @@
 #include <functional>
 #include <optional>
 #include <stop_token>
+#include <string>
 
 namespace personal_cloud {
 
@@ -18,6 +19,7 @@ using ApplicationTaskFactory =
     std::function<std::optional<ApplicationTask>(const HttpRequest&)>;
 
 struct EpollServerConfig {
+    std::string bind_address{"127.0.0.1"};
     std::uint16_t port{9000};
     int backlog{1024};
     std::size_t maximum_events{1024};

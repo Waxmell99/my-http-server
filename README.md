@@ -99,6 +99,7 @@ ctest --test-dir build --output-on-failure
 
 ```bash
 ./build/http_server \
+    --bind-address 127.0.0.1 \
     --port 9000 \
     --database data/personal_cloud.db \
     --storage-root data/files \
@@ -302,8 +303,9 @@ sudo systemctl enable --now personal-cloud
 sudo journalctl -u personal-cloud -f
 ```
 
-Nginx 配置需按实际域名修改，并经 `nginx -t` 验证后启用。当前程序默认监听所有
-地址，生产主机应通过防火墙只开放 Nginx 的 80/443 端口。
+Nginx 配置需按实际域名修改，并经 `nginx -t` 验证后启用。程序默认只监听
+`127.0.0.1`；只有明确需要直接接受其他主机连接时，才传入
+`--bind-address 0.0.0.0`。生产主机仍应通过防火墙只开放 Nginx 的 80/443 端口。
 
 在另一个终端使用 netcat 连接：
 

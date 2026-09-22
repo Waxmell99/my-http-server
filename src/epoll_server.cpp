@@ -321,7 +321,7 @@ private:
         }
 
         listening_fd_ = create_listening_socket(
-            config_.port, config_.backlog);
+            config_.bind_address, config_.port, config_.backlog);
         if (listening_fd_ == -1) {
             return false;
         }
@@ -395,7 +395,9 @@ private:
         events_.resize(config_.maximum_events);
         write_log(
             std::cout,
-            "Epoll server listening on port ",
+            "Epoll server listening on ",
+            config_.bind_address,
+            ':',
             config_.port,
             ", fd = ",
             listening_fd_,
