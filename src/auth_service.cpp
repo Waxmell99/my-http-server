@@ -341,8 +341,11 @@ HttpResponse unauthorized() {
 
 }  // namespace
 
-AuthService::AuthService(std::filesystem::path database_path)
-    : database_path_(std::move(database_path)) {
+AuthService::AuthService(
+    std::filesystem::path database_path,
+    bool allow_registration)
+    : database_path_(std::move(database_path)),
+      allow_registration_(allow_registration) {
     if (::sodium_init() < 0) {
         throw std::runtime_error("Cannot initialize libsodium");
     }
@@ -368,6 +371,13 @@ HttpResponse AuthService::handle_request(const HttpRequest& request) {
         if (path == "/api/auth/register") {
             if (request.method != "POST") {
                 return method_not_allowed("POST");
+            }
+            if (!allow_registration_) {
+                return json_error(
+                    403,
+                    "Forbidden",
+                    "registration_disabled",
+                    "Account registration is disabled");
             }
 
             HttpResponse parse_error = json_error(

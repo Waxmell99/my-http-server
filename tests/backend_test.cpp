@@ -253,7 +253,12 @@ void test_configuration() {
                "parse upload concurrency and stream buffer limits");
         expect(result.config->server.verbose_logging,
                "parse verbose logging flag");
+        expect(!result.config->allow_registration,
+               "disable account registration by default");
     }
+
+    expect(parse({"--allow-registration"}).config->allow_registration,
+           "parse the account registration opt-in flag");
 
     expect(!parse({"--port", "0"}).config.has_value(),
            "reject port zero");
@@ -416,6 +421,21 @@ void test_authentication_lifecycle_and_security() {
     personal_cloud::BackendConfig config;
     config.database_path = database_path;
     config.storage_root = temporary.path() / "files";
+
+    {
+        personal_cloud::BackendApplication application(config);
+        const personal_cloud::HttpResponse response = run_application_task(
+            application,
+            json_request(
+                "/api/auth/register",
+                "{\"username\":\"Alice\","
+                "\"password\":\"correct-horse-battery\"}"));
+        expect(response.status_code == 403 &&
+                   response.body.find("registration_disabled") !=
+                       std::string::npos,
+               "disable account registration unless explicitly enabled");
+    }
+    config.allow_registration = true;
 
     std::string persisted_cookie;
     std::string first_session_cookie;
@@ -670,6 +690,7 @@ void test_authentication_with_shared_memory_database() {
     personal_cloud::BackendConfig config;
     config.database_path = ":memory:";
     config.storage_root = temporary.path() / "files";
+    config.allow_registration = true;
 
     personal_cloud::BackendApplication application(config);
     personal_cloud::HttpResponse response = run_application_task(
@@ -762,6 +783,7 @@ void test_file_lifecycle_limits_and_isolation() {
     config.maximum_file_size = 90 * 1024;
     config.user_quota = 100 * 1024;
     config.maximum_concurrent_uploads = 1;
+    config.allow_registration = true;
 
     std::string owner_cookie;
     std::string other_cookie;

@@ -16,7 +16,9 @@ namespace personal_cloud {
 
 class AuthService final {
 public:
-    explicit AuthService(std::filesystem::path database_path);
+    AuthService(
+        std::filesystem::path database_path,
+        bool allow_registration);
 
     AuthService(const AuthService&) = delete;
     AuthService& operator=(const AuthService&) = delete;
@@ -42,6 +44,7 @@ private:
         std::chrono::steady_clock::time_point now);
 
     std::filesystem::path database_path_;
+    bool allow_registration_{false};
     std::string dummy_password_hash_;
     std::mutex failure_mutex_;
     std::unordered_map<std::string, FailureState> failures_;

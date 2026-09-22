@@ -109,7 +109,8 @@ ctest --test-dir build --output-on-failure
     --max-file-size 1073741824 \
     --user-quota 10737418240 \
     --max-concurrent-uploads 4 \
-    --stream-buffer-size 65536
+    --stream-buffer-size 65536 \
+    --allow-registration
 ```
 
 使用 `./build/http_server --help` 可以查看全部选项。非法配置会在创建监听
@@ -151,7 +152,8 @@ curl http://127.0.0.1:9000/api/status
 
 ## 用户认证 API
 
-注册：
+注册默认关闭，避免公网服务被任意创建账号。需要创建账号时，以
+`--allow-registration` 启动服务；创建完成后移除该参数并重启。注册请求：
 
 ```bash
 curl -i \

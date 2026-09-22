@@ -18,6 +18,7 @@ struct BackendConfig {
     std::uint64_t maximum_file_size{1024ULL * 1024ULL * 1024ULL};
     std::uint64_t user_quota{10ULL * 1024ULL * 1024ULL * 1024ULL};
     std::size_t maximum_concurrent_uploads{4};
+    bool allow_registration{false};
 };
 
 struct ConfigParseResult {

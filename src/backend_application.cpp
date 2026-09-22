@@ -114,7 +114,8 @@ BackendApplication::BackendApplication(const BackendConfig& config)
     : database_path_(prepare_database_path(config.database_path)),
       database_(database_path_),
       storage_root_(prepare_storage_root(config.storage_root)),
-      auth_service_(std::make_shared<AuthService>(database_path_)),
+      auth_service_(std::make_shared<AuthService>(
+          database_path_, config.allow_registration)),
       file_service_(std::make_shared<FileService>(
           config, auth_service_, database_path_, storage_root_)),
       schema_version_(database_.schema_version()),

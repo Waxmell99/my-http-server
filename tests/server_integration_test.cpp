@@ -917,6 +917,7 @@ void test_live_authentication_api() {
     personal_cloud::BackendConfig config;
     config.database_path = temporary_path / "auth.db";
     config.storage_root = temporary_path / "files";
+    config.allow_registration = true;
     personal_cloud::BackendApplication application(config);
     RunningServer server(
         true,
@@ -1004,6 +1005,7 @@ void test_live_streaming_file_api() {
     config.storage_root = temporary_path / "storage";
     config.maximum_file_size = 1024 * 1024;
     config.user_quota = 2 * 1024 * 1024;
+    config.allow_registration = true;
     personal_cloud::BackendApplication application(config);
     RunningServer server(
         true,

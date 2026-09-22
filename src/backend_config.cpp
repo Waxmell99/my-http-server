@@ -52,6 +52,10 @@ ConfigParseResult parse_backend_config(
             config.server.verbose_logging = true;
             continue;
         }
+        if (option == "--allow-registration") {
+            config.allow_registration = true;
+            continue;
+        }
 
         if (option == "--port") {
             if (++index >= arguments.size()) {
@@ -235,6 +239,7 @@ std::string backend_usage(std::string_view program_name) {
     usage += "  --user-quota <bytes>       Per-user stored byte limit (default: 10 GiB)\n";
     usage += "  --max-concurrent-uploads <count> Global upload limit (default: 4)\n";
     usage += "  --stream-buffer-size <bytes> Upload/download chunk limit (default: 64 KiB)\n";
+    usage += "  --allow-registration       Enable public account registration\n";
     usage += "  --verbose                  Enable per-connection logging\n";
     usage += "  --help, -h                 Show this help\n";
     return usage;
