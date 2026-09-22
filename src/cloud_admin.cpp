@@ -1,3 +1,5 @@
+#include "admin/backup_archive.h"
+
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
@@ -10,9 +12,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace {
 
@@ -39,6 +38,7 @@ struct Options {
     std::string command;
     fs::path database;
     fs::path storage_root;
+    fs::path input;
     fs::path output;
     std::uint64_t older_than_seconds{24 * 60 * 60};
     bool apply{false};
@@ -49,7 +49,10 @@ struct Options {
     throw std::runtime_error(
         std::string(message) +
         "\nUsage:\n"
-        "  cloud_admin backup --database PATH --output PATH [--force]\n"
+        "  cloud_admin backup --database PATH --storage-root PATH "
+        "--output PATH [--force]\n"
+        "  cloud_admin restore --input PATH --database PATH "
+        "--storage-root PATH\n"
         "  cloud_admin check --database PATH --storage-root PATH\n"
         "  cloud_admin cleanup --storage-root PATH [--older-than SECONDS] [--apply]");
 }
@@ -91,6 +94,8 @@ Options parse_options(int argc, char** argv) {
             options.database = value(argument);
         } else if (argument == "--storage-root") {
             options.storage_root = value(argument);
+        } else if (argument == "--input") {
+            options.input = value(argument);
         } else if (argument == "--output") {
             options.output = value(argument);
         } else if (argument == "--older-than") {
@@ -131,58 +136,42 @@ bool valid_storage_key(std::string_view key) {
            });
 }
 
-int backup_database(const Options& options) {
-    if (options.database.empty() || options.output.empty()) {
-        usage_error("backup requires --database and --output");
+int backup_archive(const Options& options) {
+    if (options.database.empty() || options.storage_root.empty() ||
+        options.output.empty()) {
+        usage_error(
+            "backup requires --database, --storage-root, and --output");
     }
-    std::error_code error;
-    if (fs::exists(options.output, error) && !options.force) {
-        throw std::runtime_error("Output exists; pass --force to replace it");
-    }
-    if (!options.output.parent_path().empty()) {
-        fs::create_directories(options.output.parent_path());
-    }
-    fs::path temporary = options.output;
-    temporary += ".tmp." + std::to_string(::getpid());
-    if (fs::exists(temporary, error)) {
-        throw std::runtime_error("Temporary backup path already exists");
-    }
-
-    SqliteHandle source = open_database(
-        options.database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX);
-    SqliteHandle destination = open_database(
-        temporary, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
-                       SQLITE_OPEN_EXCLUSIVE | SQLITE_OPEN_FULLMUTEX);
-    sqlite3_backup* backup = sqlite3_backup_init(
-        destination.get(), "main", source.get(), "main");
-    if (backup == nullptr) {
-        fs::remove(temporary, error);
-        throw std::runtime_error(
-            "Cannot initialize backup: " +
-            std::string(sqlite3_errmsg(destination.get())));
-    }
-    int result;
-    do {
-        result = sqlite3_backup_step(backup, 128);
-        if (result == SQLITE_BUSY || result == SQLITE_LOCKED) {
-            sqlite3_sleep(25);
-        }
-    } while (result == SQLITE_OK || result == SQLITE_BUSY ||
-             result == SQLITE_LOCKED);
-    const int finish_result = sqlite3_backup_finish(backup);
-    if (result != SQLITE_DONE || finish_result != SQLITE_OK) {
-        fs::remove(temporary, error);
-        throw std::runtime_error("SQLite online backup failed");
-    }
-    ::chmod(temporary.c_str(), S_IRUSR | S_IWUSR);
-    fs::rename(temporary, options.output, error);
-    if (error) {
-        fs::remove(temporary, error);
-        throw std::runtime_error("Cannot publish backup: " + error.message());
-    }
+    const personal_cloud::admin::ArchiveSummary summary =
+        personal_cloud::admin::create_backup_archive(
+            options.database,
+            options.storage_root,
+            options.output,
+            options.force);
     std::cout << Json{{"status", "ok"},
                       {"operation", "backup"},
-                      {"output", options.output.string()}}
+                      {"output", options.output.string()},
+                      {"object_files", summary.object_count},
+                      {"object_bytes", summary.object_bytes}}
+                      .dump()
+              << '\n';
+    return 0;
+}
+
+int restore_archive(const Options& options) {
+    if (options.input.empty() || options.database.empty() ||
+        options.storage_root.empty()) {
+        usage_error(
+            "restore requires --input, --database, and --storage-root");
+    }
+    const personal_cloud::admin::ArchiveSummary summary =
+        personal_cloud::admin::restore_backup_archive(
+            options.input, options.database, options.storage_root);
+    std::cout << Json{{"status", "ok"},
+                      {"operation", "restore"},
+                      {"input", options.input.string()},
+                      {"object_files", summary.object_count},
+                      {"object_bytes", summary.object_bytes}}
                       .dump()
               << '\n';
     return 0;
@@ -361,7 +350,10 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         if (options.command == "backup") {
-            return backup_database(options);
+            return backup_archive(options);
+        }
+        if (options.command == "restore") {
+            return restore_archive(options);
         }
         if (options.command == "check") {
             return check_storage(options);

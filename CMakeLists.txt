@@ -44,11 +44,19 @@ target_link_libraries(http_server
         nlohmann_json::nlohmann_json
 )
 
-add_executable(cloud_admin src/cloud_admin.cpp)
+add_executable(cloud_admin
+    src/cloud_admin.cpp
+    src/backup_archive.cpp
+)
 target_compile_features(cloud_admin PRIVATE cxx_std_20)
+target_include_directories(cloud_admin
+    PRIVATE
+        "${PROJECT_SOURCE_DIR}/include"
+)
 target_link_libraries(cloud_admin
     PRIVATE
         SQLite::SQLite3
+        PkgConfig::Sodium
         nlohmann_json::nlohmann_json
 )
 

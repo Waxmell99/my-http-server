@@ -23,6 +23,7 @@ Body 缓冲的大文件上传和下载。
 ├── README.md       # 当前进度和学习任务
 ├── guide.md        # 项目整体规划
 ├── include/
+│   ├── admin/       # 完整备份归档与恢复接口
 │   ├── app/         # 后端配置、认证/文件服务和应用层请求入口
 │   ├── concurrency/
 │   │   └── thread_pool.h   # 有界线程池接口
@@ -38,6 +39,7 @@ Body 缓冲的大文件上传和下载。
 │   └── storage/
 │       └── database.h       # SQLite 生命周期和迁移接口
 ├── src/
+│   ├── backup_archive.cpp # 流式完整备份、校验和恢复
 │   ├── backend_application.cpp # 应用路由和 JSON 状态接口
 │   ├── backend_config.cpp   # 命令行配置解析
 │   ├── auth_service.cpp     # 注册、登录、Session 和限速
@@ -261,7 +263,15 @@ fd、方法、路径和状态码，不包含 Cookie、请求 Body 或密码。
 
 ```bash
 ./build/cloud_admin backup \
-    --database data/personal_cloud.db --output backups/cloud.db
+    --database data/personal_cloud.db \
+    --storage-root data/files \
+    --output backups/cloud.pcbackup
+
+# 恢复目标必须不存在；恢复期间不要启动服务器
+./build/cloud_admin restore \
+    --input backups/cloud.pcbackup \
+    --database restored/personal_cloud.db \
+    --storage-root restored/files
 
 ./build/cloud_admin check \
     --database data/personal_cloud.db --storage-root data/files
@@ -272,9 +282,12 @@ fd、方法、路径和状态码，不包含 Cookie、请求 Body 或密码。
     --older-than 86400 --apply
 ```
 
-备份使用 SQLite 在线备份 API 且默认拒绝覆盖已有目标。`cleanup` 只扫描 `tmp/` 和
-`trash/` 下超过指定秒数的普通文件，从不删除 `objects/`。生产环境建议先备份、
-执行 `check`，再运行清理。
+备份是包含 SQLite 一致性快照和全部已提交对象的单文件流式归档，默认拒绝覆盖已有
+目标。创建归档时会核对数据库完整性、对象大小和 SHA-256；如果并发删除等操作导致
+快照与文件不一致，命令会失败且不会发布残缺归档。恢复同样校验数据库、归档和对象
+哈希，并拒绝覆盖已有数据库或存储目录。恢复前应停止服务器，完成后先执行 `check`
+再切换服务路径。`cleanup` 只扫描 `tmp/` 和 `trash/` 下超过指定秒数的普通文件，
+从不删除 `objects/`。
 
 ## 并发压测
 
