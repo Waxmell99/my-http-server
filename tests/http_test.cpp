@@ -260,8 +260,12 @@ void test_routing() {
     expect(response.status_code == 200, "GET / returns the personal home page");
     expect(response.body.find("id=\"cloudEntry\"") != std::string::npos &&
                response.body.find("href=\"/app\"") != std::string::npos &&
+               response.body.find("id=\"turntableEntry\"") !=
+                   std::string::npos &&
+               response.body.find("href=\"/turntable\"") !=
+                   std::string::npos &&
                response.body.find("fetch('/api/status'") != std::string::npos,
-           "home page links to the cloud console and reports live status");
+           "home page links to both tools and reports live status");
 
     const personal_cloud::HttpResponse app_alias =
         personal_cloud::route_request(
@@ -270,6 +274,12 @@ void test_routing() {
                app_alias.body.find("/api/auth/me") != std::string::npos &&
                app_alias.body != response.body,
            "serve the authentication and file console from /app");
+
+    response = personal_cloud::route_request(
+        {"GET", "/turntable", "HTTP/1.1", {}, {}});
+    expect(response.status_code == 200 &&
+               response.body.find("决策转盘") != std::string::npos,
+           "serve the decision turntable from its home-page entry");
 
     response = personal_cloud::route_request(
         {"GET", "/missing", "HTTP/1.1", {}, {}});

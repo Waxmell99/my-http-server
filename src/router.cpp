@@ -118,13 +118,13 @@ HttpResponse route_request(const HttpRequest& request) {
             };
         }
 
-        const auto html = read_file("public/tt.html");
+        const auto html = read_file("public/turntable.html");
         if (!html.has_value()) {
             return {
                 500,
                 "Internal Server Error",
                 "text/plain; charset=utf-8",
-                "Cannot open public/tt.html\n",
+                "Cannot open public/turntable.html\n",
             };
         }
 

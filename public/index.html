@@ -97,6 +97,12 @@
       background: var(--green-deep);
       box-shadow: 0 15px 34px rgba(41, 95, 78, .26);
     }
+    .button-secondary {
+      border-color: var(--line);
+      color: var(--green-deep);
+      background: rgba(255, 253, 248, .72);
+    }
+    .button-secondary:hover { background: var(--white); box-shadow: 0 12px 28px rgba(48, 57, 46, .1); }
     .button svg { width: 17px; height: 17px; }
     .hero {
       min-height: 610px;
@@ -327,6 +333,7 @@
     <nav class="nav" aria-label="主要导航">
       <a class="nav-link" href="#about">关于</a>
       <a class="nav-link" href="#services">空间</a>
+      <a class="nav-link" href="/turntable">幸运转盘</a>
       <a class="button button-primary" href="/app">进入个人云 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></a>
     </nav>
   </header>
@@ -339,6 +346,7 @@
         <p>这是一个安静的个人数字空间，用来保存文件、整理记忆，也记录一台小服务器持续运转的日常。</p>
         <div class="hero-actions">
           <a class="button button-primary" href="/app" id="cloudEntry">打开我的个人云 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></a>
+          <a class="button button-secondary" href="/turntable" id="turntableEntry">打开幸运转盘</a>
           <span class="quiet-note">私有存储 · 随时访问 · 自主管理</span>
         </div>
       </div>
