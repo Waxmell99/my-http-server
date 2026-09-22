@@ -122,16 +122,13 @@ SqliteHandle open_database(const fs::path& path, int flags) {
 }
 
 bool valid_storage_key(std::string_view key) {
-    if (key.size() != 64) {
-        return false;
-    }
-    for (char character : key) {
-        if (!((character >= '0' && character <= '9') ||
-              (character >= 'a' && character <= 'f'))) {
-            return false;
-        }
-    }
-    return true;
+    return key.size() == 43 &&
+           std::all_of(key.begin(), key.end(), [](char character) {
+               return (character >= 'a' && character <= 'z') ||
+                      (character >= 'A' && character <= 'Z') ||
+                      (character >= '0' && character <= '9') ||
+                      character == '-' || character == '_';
+           });
 }
 
 int backup_database(const Options& options) {

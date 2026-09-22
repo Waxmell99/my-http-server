@@ -36,7 +36,7 @@ apply_output=$(
 grep -q '"removed":1' <<<"$apply_output"
 test ! -e "$test_root/storage/tmp/stale.upload"
 
-key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 "$sqlite" "$test_root/source.db" \
     "INSERT INTO files(storage_key,size) VALUES('$key',3);"
 printf xy >"$test_root/storage/objects/$key"
@@ -48,3 +48,14 @@ inconsistent_status=$?
 set -e
 test "$inconsistent_status" -eq 2
 grep -q '"size_mismatches":1' <<<"$inconsistent_output"
+
+"$sqlite" "$test_root/source.db" \
+    "UPDATE files SET storage_key='not-a-real-storage-key';"
+set +e
+invalid_key_output=$(
+    "$admin" check --database "$test_root/source.db" \
+        --storage-root "$test_root/storage")
+invalid_key_status=$?
+set -e
+test "$invalid_key_status" -eq 2
+grep -q '"invalid_storage_keys":1' <<<"$invalid_key_output"
